@@ -6,7 +6,7 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="AsyncProc", # Replace with your own username
+    name="AsyncProc",
     version="0.0.1",
     author="HunterAP",
     author_email="hunterap23@gmail.com",

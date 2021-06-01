@@ -20,7 +20,7 @@ import logging as lg
 import traceback
 
 # Miscellaneous
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 if sys.platform.startswith("win32"):
     try:
@@ -34,12 +34,57 @@ if sys.platform.startswith("win32"):
         exit(1)
 
 
+class asyncproc_process:
+    def __init__(self):
+        return
+
+
+class asyncproc_thread:
+    def __init__(self):
+        return
+
+
+class asyncproc_function:
+    def __init__(self):
+        return
+
+
+class asyncproc_argument:
+    def __init__(self, name: str, value: Any, arg_type: type, function: str):
+        self.arg = {
+            "name": name,
+            "value": value,
+            "type": type,
+            "function": function
+        }
+
+    def get(self):
+        return self.arg
+
+
 class asyncproc_error(Exception):
     pass
 
 
 class asyncproc:
     def __init__(self, log: Union[lg.RootLogger, None] = None, procs: Union[list[int], set[int], tuple[int], None] = None, threads: Union[list[int], set[int], tuple[int], None] = None):
+        """
+        Class for creating and managing multiple processes and threads, with the ability to run them asynchronously.
+
+        Parameters
+        ----------
+        log : logging.RootLogger, None
+            A logging.RootLogger object to use for logging purposes.
+            If None, then the logging messages will be printed to the console.
+        procs : list[int], set[int], tuple[int], None
+            A list/set/tuple of integers.
+            The integers
+        sound : str
+            the sound that the animal makes
+        num_legs : int
+            the number of legs the animal has (default 4)
+        """
+
         if log is not None:
             self._log = log
         else:
@@ -109,12 +154,24 @@ class asyncproc:
     def _get_info_linux(self):
         self._cores_usable = os.sched_getaffinity(0)
         self._cores_usable_count = len(self._cores_usable)
+        sockets = []
+        physical_cores = []
+        logical_cores = []
+        cores_id = []
         with open("/proc/cpuinfo") as cpu_info:
             for line in [line.split(":") for line in cpu_info.readlines()]:
                 if (line[0].strip() == "physical id"):
-                    self._sockets_count = np.maximum(sockets, int(line[1].strip()) + 1)
-                if (line[0].strip() == "cpu cores"):
-                    self._physical_cores_per_socket = int(line[1].strip())
+                    sockets.append(int(line[1].strip()))
+                elif (line[0].strip() == "cpu cores"):
+                    physical_cores.append(int(line[1].strip()))
+                elif (line[0].strip() == "siblings"):
+                    logical_cores.append(int(line[1].strip()))
+                elif (line[0].strip() == "core id"):
+                    cores_id.append((line[1].strip()))
+
+        self._sockets_count = len(set(sockets))
+        self._cores_physical = sorted(set(physical_cores))
+        self._cores_logical = sorted(set(logical_cores))
 
     # INCOMPLETE - NEEDS TESTING ON MAC OS
     def _get_info_macos(self):
@@ -138,6 +195,13 @@ class asyncproc:
                     tmp_dict[key] = value
 
     def _get_info_windows(self):
+        tmp = sys.getwindowsversion()
+        self._windows_version_major = tmp.major
+        self._windows_version_minor = tmp.minor
+        self._windows_version_build = tmp.build
+        self._windows_version_platform = tmp.platform
+        self._windows_version_service_pack = tmp.service_pack
+
         # Get simultaneous multithreading info
         # https://docs.microsoft.com/en-us/windows/win32/cimwin32prov/win32-processor
         winmgmts_root = win32com.client.GetObject("winmgmts:root\\cimv2")
@@ -291,7 +355,6 @@ class asyncproc:
             tmp_threads = self._threads
         else:
             tmp_threads = [0]
-
 
         if processes:
             tmp_procs = processes
