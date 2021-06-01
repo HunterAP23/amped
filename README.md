@@ -21,11 +21,9 @@ Simplifies the creation of asynchronous, multiprocess, and multithreaded code
 ## Relationship between processes, threads, and functions
 - The general idea is to allow the user to specify:
   - The number of CPU physical and logical cores to use in total
-  - The number of CPU physical and logical cores to use per process
-  - The number of CPU physical and logical cores to use per thread
-  - The number of CPU physical and logical cores to use per function
+  - The number of CPU physical and logical cores to use per process on a per-process basis
   - The number of processes to run in total
-  - The number of threads to run in total
+  - The number of threads to run for each process on a per-process basis
   - The number of functions to run in total
   - The number of threads to run per process
     - If thread-per-process is 1 then do not have to manually create a thread

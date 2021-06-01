@@ -64,7 +64,7 @@ class asyncproc_function:
         else:
             raise TypeError("Function pointer is not callable.")
 
-    def get(self):
+    def get(self) -> dict:
         return vars(self)
 
 
@@ -75,7 +75,7 @@ class asyncproc_argument:
         self.type = arg_type
         self.function = function_name
 
-    def get(self):
+    def get(self) -> dict:
         return vars(self)
 
 
@@ -84,22 +84,20 @@ class asyncproc_error(Exception):
 
 
 class asyncproc:
-    def __init__(self, log: Union[lg.RootLogger, None] = None, procs: Union[list[int], set[int], tuple[int], None] = None, threads: Union[list[int], set[int], tuple[int], None] = None):
+    def __init__(self, cores: Union[list[int], set[int], tuple[int], None], log: Union[lg.RootLogger, None] = None, ):
         """
         Class for creating and managing multiple processes and threads, with the ability to run them asynchronously.
 
         Parameters
         ----------
+        cores : list[int], tuple[int], None
+            A list/set/tuple of integers which represents the CPU core affinity to use.
+            The values represent the core number.
+            The range should from 0 to the max number of cores on the system
+            If None then the program will automatically use all the cores it can.
         log : logging.RootLogger, None
             A logging.RootLogger object to use for logging purposes.
             If None, then the logging messages will be printed to the console.
-        procs : list[int], set[int], tuple[int], None
-            A list/set/tuple of integers.
-            The integers
-        sound : str
-            the sound that the animal makes
-        num_legs : int
-            the number of legs the animal has (default 4)
         """
 
         if log is not None:
@@ -153,23 +151,21 @@ class asyncproc:
             self._sys_platform = "MacOS"
             self._get_info_macos()
 
-        self._processes = None
-        self._threads = None
-        if self.set_procs(procs):
-            self._processes = procs
+        self._cores_user = None
+        self._cores_user_count = None
+        if len(cores) >= self._cores_usable_count:
+            pass
+        elif 0 < len(cores) and len(cores) <= self._cores_usable_count:
+            self._cores_user = list(set(cores))
+            self._cores_user_count = len(self._cores_user)
         else:
-            self._processes = [0]
-
-        if self.set_threads(threads):
-            self._threads = threads
-        else:
-            self._threads = [0]
+            self._cores_user = [0]
 
     def _get_info_freebsd(self):
         int(os.popen("sysctl -n hw.ncpu").readlines()[0])
 
-    def _get_info_linux(self):
-        self._cores_usable = os.sched_getaffinity(0)
+    def _get_info_linux(self) -> None:
+        self._cores_usable = tuple(os.sched_getaffinity(0))
         self._cores_usable_count = len(self._cores_usable)
         sockets = []
         physical_cores = []
@@ -191,7 +187,7 @@ class asyncproc:
         self._cores_logical = sorted(set(logical_cores))
 
     # INCOMPLETE - NEEDS TESTING ON MAC OS
-    def _get_info_macos(self):
+    def _get_info_macos(self) -> None:
         tmp_dict = dict()
         check = [
             "ncpu",
@@ -211,7 +207,7 @@ class asyncproc:
                 if key in check:
                     tmp_dict[key] = value
 
-    def _get_info_windows(self):
+    def _get_info_windows(self) -> None:
         tmp = sys.getwindowsversion()
         self._windows_version_major = tmp.major
         self._windows_version_minor = tmp.minor
@@ -251,9 +247,20 @@ class asyncproc:
             if int(x):
                 temp_cores_sys.append(i)
 
-        self._cores_usable = set(temp_cores_proc)
-        self._cores_usable_sys = set(temp_cores_sys)
+        self._cores_usable = tuple(set(temp_cores_proc))
         self._cores_usable_count = len(self._cores_usable)
+
+    def int_to_mask(val: int):
+        return "{0:08b}".format(val)
+
+    def mask_to_affinity(mask: Union[int, str, list, tuple]):
+        mask_list = []
+        if type(mask) in (int, str):
+            mask = list(str(mask))
+        mask_list = list(mask)
+        mask_reversed = list(reversed(mask_list))
+
+        return tuple(mask_reversed[i] for i in range(len(mask_list)))
 
     def _run_in_parallel(self, functions: Union[dict, list, tuple], arguments: Union[dict, list, tuple], threads: int, sema: mp.Semaphore, rlock: mp.RLock, no_args: bool = False):
         # proc = []
@@ -324,7 +331,7 @@ class asyncproc:
     def _run_map(self, func, args, name: str):
         return
 
-    def _test_callable(self, method: Callable, name: str):
+    def _test_callable(self, method: Callable, name: str) -> bool:
         try:
             if callable(method):
                 return True
@@ -363,27 +370,6 @@ class asyncproc:
                 print(e)
             return ret
 
-    def _validate_threads_processes(self, threads: Union[int, None] = None, processes: Union[int, None] = None) -> bool:
-        tmp_threads = None
-        tmp_procs = None
-        if threads:
-            tmp_threads = threads
-        elif self._threads:
-            tmp_threads = self._threads
-        else:
-            tmp_threads = [0]
-
-        if processes:
-            tmp_procs = processes
-        elif self._processes:
-            tmp_procs = self._processes
-        else:
-            tmp_procs = [0]
-
-        if len(tmp_threads) * len(tmp_procs) > self._cores_usable_count:
-            return False
-        return True
-
     def create_pool(self):
         check = (self._procs is None, self._procs == 0)
         if self._cores_usable_count is not None:
@@ -408,28 +394,28 @@ class asyncproc:
     def get_affinity(self) -> Union[list, set, tuple]:
         return self._cores_usable
 
-    def set_affinity(self, affinity: Union[list, tuple]) -> bool:
+    def set_affinity(self, affinity: Union[list[int], set[int], tuple[int]]) -> bool:
         # Remove duplicate entries
         new_affinity = set(affinity)
 
         # Make sure there are elements
         if len(new_affinity) == 0:
-            return False
+            raise ValueError("No affinity was provided.")
 
         # Get rid of any elements greater than the highest core number
         while max(new_affinity) > max(self._cores_usable):
             new_affinity.discard(max(new_affinity))
 
         # Make sure there are no entries less than 0
-        while 0 in new_affinity:
+        while min(new_affinity) < min(self._cores_usable):
             new_affinity.discard(min(new_affinity))
 
         # Make sure we still have elements after removing the above values
         if len(new_affinity) == 0:
-            return False
+            raise ValueError("No affinity values remain after removing unusable values.")
 
-            self._cores_usable = tuple(new_affinity)
-            return True
+        self._cores_usable = tuple(new_affinity)
+        return True
 
     def get_cores_count(self) -> int:
         return self._core_count
@@ -439,24 +425,6 @@ class asyncproc:
 
     def get_sys_platform(self) -> str:
         return self._sys_platform
-
-    def get_threads(self) -> int:
-        return self._threads
-
-    def set_threads(self, threads: Union[list[int], set[int], tuple[int]]) -> bool:
-        if self._validate_threads_processes(threads=threads):
-            self._threads = threads
-            return True
-        return False
-
-    def get_procs(self) -> int:
-        return self._processes
-
-    def set_procs(self, processes: Union[list[int], set[int], tuple[int]]) -> bool:
-        if self._validate_threads_processes(processes=processes):
-            self._processes = processes
-            return True
-        return False
 
     def get_funcs(self) -> Union[dict, list, set, tuple]:
         return self._funcs
