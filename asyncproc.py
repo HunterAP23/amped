@@ -34,40 +34,6 @@ if sys.platform.startswith("win32"):
         exit(1)
 
 
-class asyncproc_function:
-    def __init__(self, name: str, pointer: Callable, instances: Union[list[int], set[int], tuple[int]]):
-        if callable(pointer):
-            self.name = name
-            self.pointer = pointer
-            self.instances = list(set(instances))
-            self.arguments = {}
-            params = inspect.signature(pointer).parameters
-            for item in params.values():
-                self.arguments[item.name] = {
-                    "annotation": item.annotation,
-                    "kind": item.kind
-                }
-                if item.default == inspect.Parameter.empty:
-                    self.arguments[item.name]["default"] = None
-                else:
-                    self.arguments[item.name]["default"] = item.default
-
-                if item.annotation == inspect.Parameter.empty:
-                    self.arguments[item.name]["type"] = None
-                elif type(item.default) is type:
-                    self.arguments[item.name]["type"] = item.annotation
-                elif item.annotation.__module__ == "typing":
-                    self.arguments[item.name]["type"] = []
-                    for t in item.annotation.__args__:
-                        self.arguments[item.name]["type"].append(t)
-                    self.arguments[item.name]["type"] = tuple(set(self.arguments[item.name]["type"]))
-        else:
-            raise TypeError("Function pointer is not callable.")
-
-    def get(self) -> dict:
-        return vars(self)
-
-
 class asyncproc_argument:
     def __init__(self, name: str, value: Any, arg_type: type, function_name: str):
         self.name = name
@@ -84,20 +50,86 @@ class asyncproc_error(Exception):
 
 
 class asyncproc:
-    def __init__(self, cores: Union[list[int], set[int], tuple[int], None], log: Union[lg.RootLogger, None] = None, ):
+    """
+    Class for creating and managing multiple processes and threads, with the ability to run them asynchronously.
+
+    Attributes
+    ----------
+    For all operating systems:
+        _cores_count : int
+            The number of logical CPU cores the system has available in total.
+        _cores_logical : list[int]
+            The number of logical CPU cores for each socket on the system.
+        _cores_physical : list[int]
+            The number of physical CPU cores for each socket on the system.
+        _cores_usable: list[int]
+            The CPU cores that are usable by this Python process, also known as the CPU affinity of the process.
+            Each integer in the list is numbered after a single logical CPU core.
+            The elements' values range from core 0 to the maximum number of logical CPU cores on the system.
+        _cores_usable_count : int
+            A count of logical CPU cores available to this Python process.
+        _cores_user : list[int]
+            A list of integers representing the CPU cores to utilize as specified by the user.
+            Each integer in the list is numbered after a single logical CPU core.
+            The elements' values range from core 0 to the maximum number of logical CPU cores on the system.
+        _cores_user_count : int
+            A count of CPU cores to utilize as specified by the user.
+        _log : logging.RootLogger, None
+            RootLogger object for writing messages to a file.
+            If not provided hen messages are printed to the console's stdout.
+        _pid : int
+            The process ID for the main Python process.
+        _platform_cpu : str
+            The CPU information as identified from the platform module.
+        _platform_machine : str
+            The system's CPY architecture information as identified from the platform module.
+        _platform_node : str
+            The system's unique name as identified from the platform module.
+        _platform_release : str
+            The OS release information as identified from the platform module.
+        _platform_system : str
+            The OS name as identified from the platform module.
+        _platform_version : str
+            The full OS version number as identified from the platform module.
+        _python_version_major : str
+            The major Python executable version number.
+        _python_version_minor : str
+            The minor Python executable version number.
+        _python_version_patch : str
+            The patch Python executable version number.
+        _smt : list[bool]
+            A list of bools defining whether SMT is enabled for each socket in the system.
+        _sockets_count : int
+            A count of the number of sockets in the system.
+        _sys_platform : str
+            The system's OS name as identifed from the sys module.
+
+    Only for Windows operating systems:
+        _windows_version_build : str
+            The Windows build version number.
+        _windows_version_major : str
+            The Windows major version number.
+        _windows_version_minor : str
+            The Windows minor version number.
+    """
+
+    def __init__(self, cores: Union[int, list[int], set[int], tuple[int], None] = None, log: Union[lg.RootLogger, None] = None):
         """
-        Class for creating and managing multiple processes and threads, with the ability to run them asynchronously.
+        Contructs the asyncproc object and collects system information.
 
         Parameters
         ----------
-        cores : list[int], tuple[int], None
-            A list/set/tuple of integers which represents the CPU core affinity to use.
-            The values represent the core number.
-            The range should from 0 to the max number of cores on the system
-            If None then the program will automatically use all the cores it can.
-        log : logging.RootLogger, None
-            A logging.RootLogger object to use for logging purposes.
-            If None, then the logging messages will be printed to the console.
+            cores : int, list[int], tuple[int], None
+                An int or list/set/tuple of integers which represents the CPU core affinity to use.
+                If it's an integer, it should be the total number of CPU cores to utilize with no preference for CPU core affinity.
+                If it's a list/set/tuple, it should contain integers specifiying which cores to utilize specifically.
+                The range should from 0 to the max number of cores on the system.
+                Values less than 0 or greater than the max core number are truncated, and duplicate entrieis are removed.
+                If the value is None then the program will automatically use all the cores it can.
+
+            log : logging.RootLogger, None
+                A logging.RootLogger object to use for logging purposes.
+                If None, then the logging messages will be printed to the console.
         """
 
         if log is not None:
@@ -153,7 +185,7 @@ class asyncproc:
 
         self._cores_user = None
         self._cores_user_count = None
-        if len(cores) >= self._cores_usable_count:
+        if cores is None or len(cores) >= self._cores_usable_count:
             pass
         elif 0 < len(cores) and len(cores) <= self._cores_usable_count:
             self._cores_user = list(set(cores))
@@ -161,30 +193,54 @@ class asyncproc:
         else:
             self._cores_user = [0]
 
-    def _get_info_freebsd(self):
+    def _get_info_freebsd(self) -> None:
+        """
+        Get system information for FreeBSD systems.
+
+            Parameters:
+                None
+        """
         int(os.popen("sysctl -n hw.ncpu").readlines()[0])
 
     def _get_info_linux(self) -> None:
+        """
+        Get system information for Linux systems.
+
+        Parameters
+        ----------
+
+        """
         self._cores_usable = tuple(os.sched_getaffinity(0))
         self._cores_usable_count = len(self._cores_usable)
-        sockets = []
-        physical_cores = []
-        logical_cores = []
-        cores_id = []
-        with open("/proc/cpuinfo") as cpu_info:
-            for line in [line.split(":") for line in cpu_info.readlines()]:
-                if (line[0].strip() == "physical id"):
-                    sockets.append(int(line[1].strip()))
-                elif (line[0].strip() == "cpu cores"):
-                    physical_cores.append(int(line[1].strip()))
-                elif (line[0].strip() == "siblings"):
-                    logical_cores.append(int(line[1].strip()))
-                elif (line[0].strip() == "core id"):
-                    cores_id.append((line[1].strip()))
 
-        self._sockets_count = len(set(sockets))
-        self._cores_physical = sorted(set(physical_cores))
-        self._cores_logical = sorted(set(logical_cores))
+        dict_lscpu = dict()
+        check = [
+            "CPU(s)",
+            "On-line CPU(s) list",
+            "Thread(s) per core",
+            "Core(s) per socket",
+            "Socket(s)",
+            "Model name"
+        ]
+
+        cmd = shlex.split("lscpu")
+        ret = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
+        out, err = ret.communicate()
+        for line in out.decode().strip().split("\n"):
+            items = line.split(":")
+            key = items[0].strip()
+            value = items[1].strip()
+            if key in check:
+                dict_lscpu[key] = value
+
+        self._sockets_count = int(dict_lscpu["Socket(s)"])
+        self._cores_physical = int(dict_lscpu["Core(s) per socket"])
+        self._cores_logical = int(dict_lscpu["CPU(s)"])
+        tmp_range = str(dict_lscpu["On-line CPU(s) list"]).split("-")
+        self._cores_usable = tuple(i for i in range(int(tmp_range[0]), int(tmp_range[1]) + 1))
+        self._cores_usable_count = dict_lscpu["CPU(s)"]
+        self._smt = int(dict_lscpu["Thread(s) per core"]) > 1
+        self._model_name = dict_lscpu["Model name"]
 
     # INCOMPLETE - NEEDS TESTING ON MAC OS
     def _get_info_macos(self) -> None:
@@ -212,8 +268,9 @@ class asyncproc:
         self._windows_version_major = tmp.major
         self._windows_version_minor = tmp.minor
         self._windows_version_build = tmp.build
-        self._windows_version_platform = tmp.platform
-        self._windows_version_service_pack = tmp.service_pack
+
+        self._cores_physical = 0
+        self._cores_logical = 0
 
         # Get simultaneous multithreading info
         # https://docs.microsoft.com/en-us/windows/win32/cimwin32prov/win32-processor
@@ -221,46 +278,89 @@ class asyncproc:
         cpus = winmgmts_root.ExecQuery("Select * from Win32_Processor")
         for cpu in cpus:
             self._sockets_count += 1
-            self._cores_physical.append(cpu.NumberOfCores)
-            self._cores_logical.append(cpu.NumberOfLogicalProcessors)
+            self._cores_physical += cpu.NumberOfCores
+            self._cores_logical += cpu.NumberOfLogicalProcessors
             if cpu.NumberOfCores < cpu.NumberOfLogicalProcessors:
-                self._smt.append(True)
+                self._smt = True
+            self._model_name = cpu.Name
 
         # Get affinity info
         handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, self._pid)
         mask = win32process.GetProcessAffinityMask(handle)
         mask_proc = mask[0]
         mask_sys = mask[1]
-        bitmask_proc = "{0:08b}".format(mask_proc)
-        bitmask_sys = "{0:08b}".format(mask_sys)
+        affinity_proc = self.mask_to_affinity(self.int_to_mask(str(mask_proc)), tuple)
+        affinity_sys = self.mask_to_affinity(self.int_to_mask(str(mask_sys)))
 
-        temp_cores_proc = []
-        temp_cores_sys = []
-
-        for i in range(len(bitmask_proc)):
-            x = list(reversed(bitmask_proc))[i]
-            if int(x):
-                temp_cores_proc.append(i)
-
-        for i in range(len(bitmask_sys) - 1, -1, -1):
-            x = list(reversed(bitmask_sys))[i]
-            if int(x):
-                temp_cores_sys.append(i)
-
-        self._cores_usable = tuple(set(temp_cores_proc))
+        self._cores_usable = affinity_proc
         self._cores_usable_count = len(self._cores_usable)
 
-    def int_to_mask(val: int):
-        return "{0:08b}".format(val)
+    def int_to_mask(self, int_val: Union[int, str], return_type: Union[type[list, str, tuple], None] = None) -> Union[list, tuple, str]:
+        ret = "{0:08b}".format(int(int_val))
 
-    def mask_to_affinity(mask: Union[int, str, list, tuple]):
-        mask_list = []
+        if return_type is None or return_type == list:
+            return list(i for i in list(ret))
+        elif return_type == tuple:
+            return tuple(i for i in list(ret))
+        elif return_type == str:
+            return ret
+
+    def mask_to_int(self, mask: Union[int, str, list, tuple], return_type: Union[type[int, list, set, str, tuple], None] = None) -> Union[int, list, set, str, tuple]:
         if type(mask) in (int, str):
             mask = list(str(mask))
-        mask_list = list(mask)
-        mask_reversed = list(reversed(mask_list))
+        ret = "".join(mask)
 
-        return tuple(mask_reversed[i] for i in range(len(mask_list)))
+        if return_type == int:
+            return int(ret, 2)
+        elif return_type == list or return_type is None:
+            return list(i for i in ret)
+        elif return_type == set:
+            return set(ret)
+        elif return_type == str:
+            return ret
+        elif return_type == tuple:
+            return tuple(i for i in ret)
+
+    def mask_to_affinity(self, mask: Union[list, set, tuple], return_type: Union[type[list, set, tuple], None] = None) -> Union[list, set, tuple]:
+        if type(mask) in (int, str):
+            mask = list(str(mask))
+        mask_reversed = list(reversed(list(mask)))
+        ret = tuple(i for i in range(len(mask_reversed)) if int(mask_reversed[i]) == 1)
+
+        if return_type is None or return_type == list:
+            return list(ret)
+        elif return_type == set:
+            return set(ret)
+        elif return_type == tuple:
+            return ret
+
+    def affinity_to_mask(self, affinity: Union[list, set, str, tuple], return_type: Union[type[str, list, tuple], None] = None) -> Union[list, tuple, str]:
+        affinity_list = list(affinity)
+        mask_list = []
+        start = 0
+        while True:
+            if len(affinity_list) == 0:
+                break
+            min_val = min(affinity_list)
+            if len(mask_list) > 0 and len(mask_list) == min_val:
+                pass
+            else:
+                for i in range(start, min_val):
+                    mask_list.append(0)
+            mask_list.append(1)
+            start = min_val
+            affinity_list.remove(min_val)
+
+        while len(mask_list) % 8 != 0:
+            mask_list.append(0)
+
+        mask_reversed = list(reversed(mask_list))
+        if return_type is None or return_type == list:
+            return mask_reversed
+        elif return_type == tuple:
+            return tuple(mask_reversed)
+        elif return_type == str:
+            return "".join(str(i) for i in mask_reversed)
 
     def _run_in_parallel(self, functions: Union[dict, list, tuple], arguments: Union[dict, list, tuple], threads: int, sema: mp.Semaphore, rlock: mp.RLock, no_args: bool = False):
         # proc = []
@@ -426,90 +526,14 @@ class asyncproc:
     def get_sys_platform(self) -> str:
         return self._sys_platform
 
-    def get_funcs(self) -> Union[dict, list, set, tuple]:
-        return self._funcs
-
-    def set_funcs(self, funcs: Union[dict, list, set, tuple]) -> bool:
-        if type(funcs) in (list, tuple):
-            self._funcs = set()
-        return True
-
-    def add_funcs(self, funcs: Union[dict, list, set, tuple]) -> bool:
-        return True
-
-    def get_args(self) -> Union[dict, list, set, tuple]:
-        return self._args
-
-    def set_args(self, args: Union[dict, list, set, tuple]) -> bool:
-        return True
-
-    def create_argument(self, name: str, value, val_type: Optional, instances: Union[list[int], set[int], tuple[int]]) -> dict:
-        arg = {
-            "Name": name,
-            "Value": value
-        }
-
-        if val_type is not None:
-            arg["Type"] = val_type
-        else:
-            arg["Type"] = type(arg["Value"])
-
-        instances_tmp = []
-        try:
-            for inst in sorted(set(instances)):
-                if type(inst) is int:
-                    instances_tmp
-                else:
-                    raise TypeError("Instance number {} is not an integer.".format(inst))
-        except TypeError as te:
-            if self._log is not None:
-                self._log.error(te)
-            else:
-                print(te)
-        arg["Instances"] = instances_tmp
-
-        return arg
-
-    def create_function(self, name: str, pointer: Callable, instances: int) -> dict:
-        func = {
-            "Name": name,
-            "Instances": instances
-        }
-
-        try:
-            if callable(pointer):
-                func["Pointer"] = pointer
-            else:
-                raise NameError("Function {} does not exist.".format(name))
-        except NameError as ne:
-            if self._log is not None:
-                self._log.error(ne)
-            else:
-                print(ne)
-
-        func["Arguments"] = {}
-        args_params = inspect.signature(pointer).parameters
-        for item in args_params.values():
-            func["Arguments"][item.name] = {}
-
-            if item.default == inspect.Parameter.empty:
-                func["Arguments"][item.name]["default"] = None
-            else:
-                func["Arguments"][item.name]["default"] = item.default
-
-            if item.annotation == inspect.Parameter.empty:
-                func["Arguments"][item.name]["type"] = None
-            elif type(item.default) is type:
-                func["Arguments"][item.name]["type"] = item.annotation
-            elif "__module__" in dir(item.annotation) and item.annotation.__module__ == "typing":
-                func["Arguments"][item.name]["type"] = item.annotation.__args__
-        return func
-
-    def create_group(self):
+    def create_process_pool(self, processes: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
         return
 
+    def create_process(self, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+        return
 
-# if __name__ == "__main__":
-#     inst = asyncproc()
-#     for k, v in vars(inst).items():
-#         print("{}: {}".format(k, v))
+    def create_process_pool(self, threads: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+        return
+
+    def create_thread(self, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+        return
