@@ -50,6 +50,7 @@ jobs:
         with:
           python-platform: Linux # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
           python-version: 3.6 # Analyze for a specific version (3.3, 3.4, etc.) -- optional
+          project: pyright_config_unix.json
 
   check-macos:
     runs-on: macos-11
@@ -63,3 +64,4 @@ jobs:
         with:
           python-platform: Darwin # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
           python-version: 3.6 # Analyze for a specific version (3.3, 3.4, etc.) -- optional
+          project: pyright_config_unix.json
