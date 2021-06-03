@@ -13,14 +13,10 @@ on:
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  check-windows:
+    runs-on: windows-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
@@ -30,14 +26,28 @@ jobs:
         with:
           python-platform: Windows # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
           python-version: 3.6 # Analyze for a specific version (3.3, 3.4, etc.) -- optional
+
+  check-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
         
       - name: Pyright for Linux
         uses: jakebailey/pyright-action@v1.0.2
         with:
           python-platform: Linux # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
           python-version: 3.6 # Analyze for a specific version (3.3, 3.4, etc.) -- optional
-      
-      - name: Pyright for Darwin
+
+  check-macos:
+    runs-on: macos-11
+
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v2
+
+      - name: Pyright for MacOS
         uses: jakebailey/pyright-action@v1.0.2
         with:
           python-platform: Darwin # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
