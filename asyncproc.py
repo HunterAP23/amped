@@ -139,7 +139,7 @@ class asyncproc:
             The Windows minor version number.
     """
 
-    def __init__(self, cores: Union[list[int], set[int], tuple[int], None] = None, log: Union[lg.RootLogger, None] = None):
+    def __init__(self, cores: Union[list["int"], set["int"], tuple["int"], None] = None, log: Union[lg.RootLogger, None] = None):
         """
         Contructs the asyncproc object and collects system information.
 
@@ -507,7 +507,7 @@ class asyncproc:
     def get_affinity(self) -> tuple:
         return self._cores_usable
 
-    def set_affinity(self, affinity: Union[list[int], set[int], tuple[int]]) -> bool:
+    def set_affinity(self, affinity: Union["list[int]", "set[int]", "tuple[int]"]) -> bool:
         # Remove duplicate entries
         new_affinity = set(affinity)
 
