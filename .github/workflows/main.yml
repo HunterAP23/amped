@@ -2,7 +2,7 @@
 
 name: CI
 
-# Controls when the action will run. 
+# Controls when the action will run.
 on:
   # Triggers the workflow on push or pull request events but only for the main branch
   push:
@@ -20,13 +20,13 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
-      
+
       - name: Setup Python
         uses: actions/setup-python@v2.2.2
         with:
           python-version: 3.6
           architecture: x64
-          
+
       - name: Pip Installer
         uses: BSFishy/pip-action@v1
         with:
@@ -44,16 +44,15 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
-        
+
       - name: Pyright for Linux
         uses: jakebailey/pyright-action@v1.0.2
         with:
           python-platform: Linux # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
           python-version: 3.6 # Analyze for a specific version (3.3, 3.4, etc.) -- optional
-          project: pyright_config_unix.json
 
   check-macos:
-    runs-on: macos-11
+    runs-on: macos-latest
 
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
@@ -64,4 +63,3 @@ jobs:
         with:
           python-platform: Darwin # Analyze for a specific platform (Darwin, Linux, Windows) -- optional
           python-version: 3.6 # Analyze for a specific version (3.3, 3.4, etc.) -- optional
-          project: pyright_config_unix.json

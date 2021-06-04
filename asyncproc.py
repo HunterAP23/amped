@@ -1,8 +1,10 @@
 # Process related
 import asyncio
 import multiprocessing as mp
+import multiprocessing.synchronize
 import multiprocessing.dummy as mpd
 import subprocess as sp
+import threading as thrd
 
 # Scheduling related
 import sched
@@ -19,19 +21,11 @@ import inspect
 import logging as lg
 import traceback
 
-# Miscellaneous
-from typing import Any, Callable, Optional, Union
+# Typing
+from typing import Any, Callable, Tuple, Type, Union
 
-if sys.platform.startswith("win32"):
-    try:
-        import win32api
-        import win32com
-        import win32com.client
-        import win32con
-        import win32process
-    except ModuleNotFoundError as mnfe:
-        print(mnfe)
-        exit(1)
+# Miscellaneous
+import re
 
 
 class asyncproc_argument:
@@ -43,6 +37,38 @@ class asyncproc_argument:
 
     def get(self) -> dict:
         return vars(self)
+
+
+class asyncproc_process(mp.Process):
+    def __init__(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, *, daemon: Union[bool, None] = None):
+        if type(group) != str and group is not None:
+            raise TypeError("\"group\" object is not a string.")
+        if not callable(target) and target is not None:
+            raise TypeError("\"target\" object is not callable")
+        if type(args) not in (list, set, tuple) and args is not None:
+            raise TypeError("\"args\" argument is not a list, set or tuple.")
+        if type(kwargs) != dict and kwargs is not None:
+            raise TypeError("\"kwargs\" argument is not a dictionary.")
+        if type(daemon) != bool and daemon is not None:
+            raise TypeError("\"daemon\" argument is not a bool")
+        super().__init__(target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
+        self._group = group
+
+
+class asyncproc_thread(thrd.Thread):
+    def __init__(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, *, daemon: Union[bool, None] = None):
+        if type(group) != str and group is not None:
+            raise TypeError("\"group\" object is not a string.")
+        if not callable(target) and target is not None:
+            raise TypeError("\"target\" object is not callable")
+        if type(args) not in (list, set, tuple) and args is not None:
+            raise TypeError("\"args\" argument is not a list, set or tuple.")
+        if type(kwargs) != dict and kwargs is not None:
+            raise TypeError("\"kwargs\" argument is not a dictionary.")
+        if type(daemon) != bool and daemon is not None:
+            raise TypeError("\"daemon\" argument is not a bool")
+        super().__init__(target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
+        self._group = group
 
 
 class asyncproc_error(Exception):
@@ -113,15 +139,14 @@ class asyncproc:
             The Windows minor version number.
     """
 
-    def __init__(self, cores: Union[int, list[int], set[int], tuple[int], None] = None, log: Union[lg.RootLogger, None] = None):
+    def __init__(self, cores: Union[list[int], set[int], tuple[int], None] = None, log: Union[lg.RootLogger, None] = None):
         """
         Contructs the asyncproc object and collects system information.
 
         Parameters
         ----------
-            cores : int, list[int], tuple[int], None
-                An int or list/set/tuple of integers which represents the CPU core affinity to use.
-                If it's an integer, it should be the total number of CPU cores to utilize with no preference for CPU core affinity.
+            cores : list[int], tuple[int], None
+                A list/set/tuple of integers which represents the CPU core affinity to use.
                 If it's a list/set/tuple, it should contain integers specifiying which cores to utilize specifically.
                 The range should from 0 to the max number of cores on the system.
                 Values less than 0 or greater than the max core number are truncated, and duplicate entrieis are removed.
@@ -132,7 +157,16 @@ class asyncproc:
                 If None, then the logging messages will be printed to the console.
         """
 
-        if log is not None:
+        if type(cores) not in (list, set, tuple) and cores is not None:
+            raise TypeError("\"cores\" argument is not a valid type - requires list[int], set[int], tuple[int], None]")
+        else:
+            if type(cores) in (list, set, tuple):
+                if not all(True if type(i) == int else False for i in cores):
+                    raise TypeError("\"cores\" argument is not a valid type - requires list[int], set[int], tuple[int], None]")
+            elif cores is not None:
+                raise TypeError("\"cores\" argument is not a valid type - requires list[int], set[int], tuple[int], None]")
+
+        if log is not None and type(log) is not lg.RootLogger:
             self._log = log
         else:
             self._log = None
@@ -150,6 +184,8 @@ class asyncproc:
         self._python_version_minor = ret[1]
         self._python_version_patch = ret[2]
 
+        self._thread_count = self.get_thread_count()
+
         del ret
 
         # Save this Python process' PID for future use.
@@ -159,9 +195,9 @@ class asyncproc:
         # For saving count of CPU sockets in systems, mostly for multi-socket use
         self._sockets_count = 0
         # Which cores are usable, based on the affinity for this process
-        self._cores_usable = None
+        self._cores_usable = ()
         # Number of usable cores
-        self._cores_usable_count = None
+        self._cores_usable_count = 0
         # List of physical cores - typically even numbered starting at 0
         self._cores_physical = []
         # List of logical cores - typically odd numbered starting at 1
@@ -169,29 +205,49 @@ class asyncproc:
         # Whether the system has Simultaneous Multithreading / Hyperthreading
         # This is a list for measuring SMT on multiple sockets,
         self._smt = []
-        if sys.platform.startswith("freebsd"):
-            self._sys_platform = "FreeBSD"
-        elif sys.platform.startswith("linux"):
+        if sys.platform == "linux":
             self._sys_platform = "Linux"
             self._get_info_linux()
-        elif sys.platform.startswith("aix"):
+        elif sys.platform == "aix":
             self._sys_platform = "AIX"
-        elif sys.platform.startswith("win32"):
+        elif sys.platform == "win32":
             self._sys_platform = "Windows"
+            try:
+                global win32api
+                import win32api
+                global win32com
+                import win32com
+                import win32com.client
+                global win32con
+                import win32con
+                global win32process
+                import win32process
+            except ModuleNotFoundError as mnfe:
+                print(mnfe)
+                exit(1)
             self._get_info_windows()
-        elif sys.platform.startswith("darwin"):
+        elif sys.platform == "darwin":
             self._sys_platform = "MacOS"
             self._get_info_macos()
+        elif sys.platform.startswith("freebsd"):
+            self._sys_platform = "FreeBSD"
 
         self._cores_user = None
         self._cores_user_count = None
-        if cores is None or len(cores) >= self._cores_usable_count:
-            pass
+        if  cores is None or len(cores) >= self._cores_usable_count:
+            self._cores_user = self._cores_usable
+            self._cores_user_count = self._cores_usable_count
         elif 0 < len(cores) and len(cores) <= self._cores_usable_count:
-            self._cores_user = list(set(cores))
+            self._cores_user = cores
             self._cores_user_count = len(self._cores_user)
         else:
-            self._cores_user = [0]
+            self._cores_user = self._cores_usable
+            self._cores_user_count = self._cores_usable_count
+
+        # A dictionary of processes, with keys being the group name.
+        self._processes = {}
+        # A dictionary of threads, with keys being the group name.
+        self._threads = {}
 
     def _get_info_freebsd(self) -> None:
         """
@@ -210,10 +266,13 @@ class asyncproc:
         ----------
 
         """
+        if sys.platform != "linux":
+            raise OSError("Operating system is not Linux.")
+
         self._cores_usable = tuple(os.sched_getaffinity(0))
         self._cores_usable_count = len(self._cores_usable)
 
-        dict_lscpu = dict()
+        dict_lscpu = {}
         check = [
             "CPU(s)",
             "On-line CPU(s) list",
@@ -238,13 +297,15 @@ class asyncproc:
         self._cores_logical = int(dict_lscpu["CPU(s)"])
         tmp_range = str(dict_lscpu["On-line CPU(s) list"]).split("-")
         self._cores_usable = tuple(i for i in range(int(tmp_range[0]), int(tmp_range[1]) + 1))
-        self._cores_usable_count = dict_lscpu["CPU(s)"]
         self._smt = int(dict_lscpu["Thread(s) per core"]) > 1
         self._model_name = dict_lscpu["Model name"]
 
     # INCOMPLETE - NEEDS TESTING ON MAC OS
     def _get_info_macos(self) -> None:
-        tmp_dict = dict()
+        if sys.platform != "darwin":
+            raise OSError("Operating system is not MacOS.")
+
+        tmp_dict = {}
         check = [
             "ncpu",
             "activecpu",
@@ -264,6 +325,9 @@ class asyncproc:
                     tmp_dict[key] = value
 
     def _get_info_windows(self) -> None:
+        if sys.platform != "win32":
+            raise OSError("Operating system is not Windows.")
+
         tmp = sys.getwindowsversion()
         self._windows_version_major = tmp.major
         self._windows_version_minor = tmp.minor
@@ -287,61 +351,35 @@ class asyncproc:
         # Get affinity info
         handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, self._pid)
         mask = win32process.GetProcessAffinityMask(handle)
-        mask_proc = mask[0]
-        mask_sys = mask[1]
-        affinity_proc = self.mask_to_affinity(self.int_to_mask(str(mask_proc)), tuple)
-        affinity_sys = self.mask_to_affinity(self.int_to_mask(str(mask_sys)))
 
-        self._cores_usable = affinity_proc
+        self._cores_usable = self._mask_to_affinity(self._int_to_mask(int(mask[0])))
         self._cores_usable_count = len(self._cores_usable)
 
-    def int_to_mask(self, int_val: Union[int, str], return_type: Union[type[list, str, tuple], None] = None) -> Union[list, tuple, str]:
+    def _int_to_mask(self, int_val: int) -> Tuple[str, ...]:
+        if type(int_val) != int:
+            raise TypeError("\"int_val\" argument was not an int or str.")
         ret = "{0:08b}".format(int(int_val))
+        ret2: Tuple[str, ...] = tuple(i for i in ret)
+        return ret2
 
-        if return_type is None or return_type == list:
-            return list(i for i in list(ret))
-        elif return_type == tuple:
-            return tuple(i for i in list(ret))
-        elif return_type == str:
-            return ret
-
-    def mask_to_int(self, mask: Union[int, str, list, tuple], return_type: Union[type[int, list, set, str, tuple], None] = None) -> Union[int, list, set, str, tuple]:
-        if type(mask) in (int, str):
-            mask = list(str(mask))
+    def _mask_to_int(self, mask: Tuple[str, ...]) -> Tuple[str, ...]:
         ret = "".join(mask)
+        ret2: Tuple[str, ...] = tuple(i for i in ret)
+        return ret2
 
-        if return_type == int:
-            return int(ret, 2)
-        elif return_type == list or return_type is None:
-            return list(i for i in ret)
-        elif return_type == set:
-            return set(ret)
-        elif return_type == str:
-            return ret
-        elif return_type == tuple:
-            return tuple(i for i in ret)
-
-    def mask_to_affinity(self, mask: Union[list, set, tuple], return_type: Union[type[list, set, tuple], None] = None) -> Union[list, set, tuple]:
-        if type(mask) in (int, str):
-            mask = list(str(mask))
+    def _mask_to_affinity(self, mask: Tuple[str, ...]) -> Tuple[str, ...]:
         mask_reversed = list(reversed(list(mask)))
-        ret = tuple(i for i in range(len(mask_reversed)) if int(mask_reversed[i]) == 1)
+        ret: Tuple[str, ...] = tuple(str(i) for i in range(len(mask_reversed)) if int(mask_reversed[i]) == 1)
+        return ret
 
-        if return_type is None or return_type == list:
-            return list(ret)
-        elif return_type == set:
-            return set(ret)
-        elif return_type == tuple:
-            return ret
-
-    def affinity_to_mask(self, affinity: Union[list, set, str, tuple], return_type: Union[type[str, list, tuple], None] = None) -> Union[list, tuple, str]:
+    def affinity_to_mask(self, affinity: Tuple[str, ...]) -> Tuple[str, ...]:
         affinity_list = list(affinity)
         mask_list = []
         start = 0
         while True:
             if len(affinity_list) == 0:
                 break
-            min_val = min(affinity_list)
+            min_val = int(min(affinity_list))
             if len(mask_list) > 0 and len(mask_list) == min_val:
                 pass
             else:
@@ -349,84 +387,80 @@ class asyncproc:
                     mask_list.append(0)
             mask_list.append(1)
             start = min_val
-            affinity_list.remove(min_val)
+            affinity_list.remove(str(min_val))
 
         while len(mask_list) % 8 != 0:
             mask_list.append(0)
 
         mask_reversed = list(reversed(mask_list))
-        if return_type is None or return_type == list:
-            return mask_reversed
-        elif return_type == tuple:
-            return tuple(mask_reversed)
-        elif return_type == str:
-            return "".join(str(i) for i in mask_reversed)
+        ret: Tuple[str, ...] = tuple(mask_reversed)
+        return ret
 
-    def _run_in_parallel(self, functions: Union[dict, list, tuple], arguments: Union[dict, list, tuple], threads: int, sema: mp.Semaphore, rlock: mp.RLock, no_args: bool = False):
-        # proc = []
-        # for func in funcs:
-        #     p = mp.Process(target=self._time_function, args=(func, args[func], sema, rlock))
-        #     proc.append(p)
-        #
-        # for p in proc:
-        #     p.start()
-        #
-        # for p in proc:
-        #     try:
-        #         p.join()
-        #     except Exception as e:
-        #         self._log.error(e)
-        funcs_data = dict()
-        args_data = dict()
-        try:
-            # Handle functions
-            funcs_items = []
-            if len(functions) == 0:
-                raise IndexError("No functions were given.")
-            elif type(functions) is dict:
-                funcs_items = [(name, func) for name, func in functions.items()]
-            elif type(functions) in (list, tuple):
-                for item in functions:
-                    # Expect pair of "name, function" as a dict, list, or tuple
-                    if type(item) not in (dict, tuple, list):
-                        raise TypeError("Function list contains a non-iterable element (requires a dict, list, or tuple).")
-                funcs_items = [(name, func) for name, func in item]
-            for name, func in funcs_items:
-                if self._test_callable(name, func):
-                    funcs_data[name] = dict()
-                    funcs_data[name]["Function"] = func
-            if len(funcs_data) == 0:
-                raise IndexError("None of the given functions are callable.")
-
-            # Handle arguments
-            args_items = []
-            if not self._no_args and len(arguments) == 0:
-                raise IndexError("User specified that arguments are required but did no arguments were given.")
-            elif type(arguments) is dict:
-                args_items = [(name, value) for name, value in arguments.items()]
-            elif type(arguments) in (list, tuple):
-                for item in arguments:
-                    # Expect pair of "name, function" as a dict, list, or tuple
-                    if type(item) not in (dict, tuple, list):
-                        raise TypeError("Argument list contains a non-iterable element (requires a dict, list, or tuple).")
-                    elif type(item) is dict:
-                        args_items = [(name, value) for name, value in item]
-                    elif type(item) in (list, tuple):
-                        args_items = [(name, value) for name, value in item]
-            for name, func in args_items:
-                if self._test_callable(name, func):
-                    args_data[name] = dict()
-                    args_data[name]["Function"] = func
-            if len(funcs_data) == 0:
-                raise IndexError("None of the given functions are callable.")
-        except IndexError as ie:
-            if self._log is not None:
-                self._log.critical(ie)
-            else:
-                print(ie)
-            exit(1)
-
-        self._run_map(func)
+    # def _run_in_parallel(self, functions: Union[dict, list, tuple], arguments: Union[dict, list, tuple], threads: int, sema: mp.synchronize.Semaphore, rlock: mp.synchronize.RLock):
+    #     # proc = []
+    #     # for func in funcs:
+    #     #     p = mp.Process(target=self._time_function, args=(func, args[func], sema, rlock))
+    #     #     proc.append(p)
+    #     #
+    #     # for p in proc:
+    #     #     p.start()
+    #     #
+    #     # for p in proc:
+    #     #     try:
+    #     #         p.join()
+    #     #     except Exception as e:
+    #     #         self._log.error(e)
+    #     funcs_data = {}
+    #     args_data = {}
+    #     try:
+    #         # Handle functions
+    #         funcs_items = []
+    #         if len(functions) == 0:
+    #             raise IndexError("No functions were given.")
+    #         elif type(functions) is dict:
+    #             funcs_items = [(name, func) for name, func in functions.items()]
+    #         elif type(functions) in (list, tuple):
+    #             for item in functions:
+    #                 # Expect pair of "name, function" as a dict, list, or tuple
+    #                 if type(item) not in (dict, tuple, list):
+    #                     raise TypeError("Function list contains a non-iterable element (requires a dict, list, or tuple).")
+    #             funcs_items = [(name, func) for name, func in functions]
+    #         for name, func in funcs_items:
+    #             if self._test_callable(name, func):
+    #                 funcs_data[name] = {}
+    #                 funcs_data[name]["Function"] = func
+    #         if len(funcs_data) == 0:
+    #             raise IndexError("None of the given functions are callable.")
+    #
+    #         # Handle arguments
+    #         args_items = []
+    #         if not self._no_args and len(arguments) == 0:
+    #             raise IndexError("User specified that arguments are required but did no arguments were given.")
+    #         elif type(arguments) is dict:
+    #             args_items = [(name, value) for name, value in arguments.items()]
+    #         elif type(arguments) in (list, tuple):
+    #             for item in arguments:
+    #                 # Expect pair of "name, function" as a dict, list, or tuple
+    #                 if type(item) not in (dict, tuple, list):
+    #                     raise TypeError("Argument list contains a non-iterable element (requires a dict, list, or tuple).")
+    #                 elif type(item) is dict:
+    #                     args_items = [(name, value) for name, value in item]
+    #                 elif type(item) in (list, tuple):
+    #                     args_items = [(name, value) for name, value in item]
+    #         for name, func in args_items:
+    #             if self._test_callable(name, func):
+    #                 args_data[name] = {}
+    #                 args_data[name]["Function"] = func
+    #         if len(funcs_data) == 0:
+    #             raise IndexError("None of the given functions are callable.")
+    #     except IndexError as ie:
+    #         if self._log is not None:
+    #             self._log.critical(ie)
+    #         else:
+    #             print(ie)
+    #         exit(1)
+    #
+    #     self._run_map(func)
 
     def _run_map(self, func, args, name: str):
         return
@@ -448,50 +482,29 @@ class asyncproc:
                 print(te)
             return False
 
-    def _time_function(self, func, args: Union[dict, list, set, tuple], sema, rlock) -> bool:
-        ret = dict()
-        ret["Success"] = False
-        was_acquired = False
-        try:
-            was_acquired = True
-            sema.acquire()
-            ret["return"] = func(**args, sema=sema)
-            sema.release()
-            was_acquired = False
-            ret["Success"] = True
-            return ret
-        except Exception as e:
-            if was_acquired:
-                sema.release()
-            ret["Success"] = False
-            if self._log is not None:
-                self._log.error(e)
-            else:
-                print(e)
-            return ret
+    # def _time_function(self, func: Callable, args: Union[dict, list, set, tuple], sema: mp.synchronize.Semaphore, rlock: mp.synchronize.RLock) -> dict:
+    #     ret = {}
+    #     ret["Success"] = False
+    #     was_acquired = False
+    #     try:
+    #         was_acquired = True
+    #         sema.acquire()
+    #         ret["return"] = func(**args, sema=sema)
+    #         sema.release()
+    #         was_acquired = False
+    #         ret["Success"] = True
+    #         return ret
+    #     except Exception as e:
+    #         if was_acquired:
+    #             sema.release()
+    #         ret["Success"] = False
+    #         if self._log is not None:
+    #             self._log.error(e)
+    #         else:
+    #             print(e)
+    #         return ret
 
-    def create_pool(self):
-        check = (self._procs is None, self._procs == 0)
-        if self._cores_usable_count is not None:
-            if any(check) or self._procs >= self._core_count:
-                self._pool_proc = mp.pool.Pool(self._core_count)
-            elif len(self._processes) < self._core_count:
-                if self._processes == [0]:
-                    self._processes = [1]
-                try:
-                    self._pool_proc = mp.Pool(self._processes)
-                except Exception as e:
-                    if self._log is not None:
-                        self._log.error(e)
-                    else:
-                        print(e)
-        else:
-            if any(check) or self._cores_count >= self._cores_usable_count:
-                self._pool_proc = mp.Pool(self._cores_usable_count)
-            elif self._cores_count < self._cores_usable_count:
-                self._pool_proc = mp.Pool(self._cores_count)
-
-    def get_affinity(self) -> Union[list, set, tuple]:
+    def get_affinity(self) -> tuple:
         return self._cores_usable
 
     def set_affinity(self, affinity: Union[list[int], set[int], tuple[int]]) -> bool:
@@ -517,23 +530,48 @@ class asyncproc:
         self._cores_usable = tuple(new_affinity)
         return True
 
-    def get_cores_count(self) -> int:
-        return self._core_count
+    def get_thread_count(self):
+        return thrd.active_count()
 
-    def get_pid(self) -> int:
-        return self._pid
+    def create_process_pool(self, group: Union[str, None] = None, processes: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None) -> bool:
+        check = (processes is None, (type(processes == int) and processes == 0))
 
-    def get_sys_platform(self) -> str:
-        return self._sys_platform
+        try:
+            if group is not None:
+                try:
+                    group = str(group)
+                except TypeError as te:
+                    if self._log is not None:
+                        self._log.error(te)
+                    else:
+                        print(te)
+                    return False
 
-    def create_process_pool(self, processes: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+                if group not in self._processes:
+                    self._processes[group] = mp.Pool(self._cores_user_count)
+                else:
+                    ends_in_number = re.search(r"\d+$", group)
+                    if ends_in_number is not None:
+                        group_new = str(group.rstrip(ends_in_number.group()))
+                        new_number = str(int(ends_in_number.group()) + 1)
+                        self._processes[group_new + new_number] = mp.Pool(self._cores_user_count)
+                    else:
+                        self._processes[group + "-1"] = mp.Pool(self._cores_user_count)
+                return True
+            return False
+
+        except Exception as e:
+            if self._log is not None:
+                self._log.error(e)
+            else:
+                print(e)
+            return False
+
+    def create_process(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, daemon: Union[bool, None] = None):
         return
 
-    def create_process(self, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+    def create_thread_pool(self, group: Union[str, None] = None, threads: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
         return
 
-    def create_process_pool(self, threads: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
-        return
-
-    def create_thread(self, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+    def create_thread(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, daemon: Union[bool, None] = None):
         return
