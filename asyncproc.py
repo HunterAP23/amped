@@ -139,7 +139,7 @@ class asyncproc:
             The Windows minor version number.
     """
 
-    def __init__(self, cores: Union[list["int"], set["int"], tuple["int"], None] = None, log: Union[lg.RootLogger, None] = None):
+    def __init__(self, cores: Union["list[int]", "set[int]", "tuple[int]", None] = None, log: Union[lg.RootLogger, None] = None):
         """
         Contructs the asyncproc object and collects system information.
 
