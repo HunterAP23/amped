@@ -42,29 +42,34 @@ Simplifies the creation of asynchronous, multiprocess, and multithreaded code
         - Only specifies info for processes-per-core
         - Does not specify how many threads per process
 
-## Core/Process/Thread/Function/Argument object idea
-```python
-cores = {
-    "0": {
-        "processes": 2,
-        "threads": 3,
-        "functions": {
-            "func1": {
-                "call": func1,
-                "arguments": {
-                    "arg1": {
-                        "value": 1,
-                        "type": int
-                    },
-                    "arg2": {
-                        "value": "test",
-                        "type": str
-                    }
-                }
-            },
-            "func2": {...}
-        },
-    },
-    "1": {...}
-}
-```
+    group
+    	- specified by user at creation time or provided before running the pool, else part of default "main" group
+    	- if child pools are not explicitly given a group, then inherit parent's group
+
+    name
+    	- specified by user at creation time
+    	- threadpool normally multiplies the # of CPU's by 5, so take name and append 1 to X to it
+
+    affinity
+    	- specified by user at creation time or changed later but before running the pool, else inherited from parent (current) process
+
+    max_workers
+    	- based on affinity var
+    	- threadpool normally multiplies the # of CPU's by 5, have extra flag for threadpool to specifiy "threads per process"
+
+    mp_context
+      - default to "spawn" on all systems
+
+    initializer
+    	- specified by user at creation time, else None
+    	- can not be changed
+
+    initargs
+    	- specified by user at creation time, else None
+    	- can not be changed
+
+    function(s)
+    	- specified by user before calling "submit" or "map" calls but after creation of pool
+
+    args
+    	- specified by user before calling "submit" or "map" calls but after creation of pool

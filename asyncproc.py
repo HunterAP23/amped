@@ -1,13 +1,14 @@
 # Process related
 import asyncio
+import psutil
 import multiprocessing as mp
-import multiprocessing.synchronize
-import multiprocessing.dummy as mpd
+import multiprocessing.pool
+import multiprocessing.synchronize as sync
 import subprocess as sp
-import threading as thrd
 
 # Scheduling related
 import sched
+import functools as ft
 
 # System related
 import os
@@ -22,53 +23,20 @@ import logging as lg
 import traceback
 
 # Typing
-from typing import Any, Callable, Tuple, Type, Union
+from typing import Any, Callable, Iterable, Mapping, Type, Union
 
 # Miscellaneous
 import re
 
 
-class asyncproc_argument:
-    def __init__(self, name: str, value: Any, arg_type: type, function_name: str):
-        self.name = name
-        self.value = value,
-        self.type = arg_type
-        self.function = function_name
-
-    def get(self) -> dict:
-        return vars(self)
+def _check_instance(var: Any, name: str, types: Union[Type, tuple[Type, ...]], can_be_none=True) -> None:
+    if not isinstance(var, types) and var is None and not can_be_none:
+        raise TypeError("\"{}\" object is not of type {}.".format(name, types))
 
 
-class asyncproc_process(mp.Process):
-    def __init__(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, *, daemon: Union[bool, None] = None):
-        if type(group) != str and group is not None:
-            raise TypeError("\"group\" object is not a string.")
-        if not callable(target) and target is not None:
-            raise TypeError("\"target\" object is not callable")
-        if type(args) not in (list, set, tuple) and args is not None:
-            raise TypeError("\"args\" argument is not a list, set or tuple.")
-        if type(kwargs) != dict and kwargs is not None:
-            raise TypeError("\"kwargs\" argument is not a dictionary.")
-        if type(daemon) != bool and daemon is not None:
-            raise TypeError("\"daemon\" argument is not a bool")
-        super().__init__(target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
-        self._group = group
-
-
-class asyncproc_thread(thrd.Thread):
-    def __init__(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, *, daemon: Union[bool, None] = None):
-        if type(group) != str and group is not None:
-            raise TypeError("\"group\" object is not a string.")
-        if not callable(target) and target is not None:
-            raise TypeError("\"target\" object is not callable")
-        if type(args) not in (list, set, tuple) and args is not None:
-            raise TypeError("\"args\" argument is not a list, set or tuple.")
-        if type(kwargs) != dict and kwargs is not None:
-            raise TypeError("\"kwargs\" argument is not a dictionary.")
-        if type(daemon) != bool and daemon is not None:
-            raise TypeError("\"daemon\" argument is not a bool")
-        super().__init__(target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
-        self._group = group
+def _check_callable(func: Callable, name: str, can_be_none=True) -> None:
+    if not callable(func) and func is not None:
+        raise TypeError("Function \"{}\" object is not callable.".format(name))
 
 
 class asyncproc_error(Exception):
@@ -139,13 +107,13 @@ class asyncproc:
             The Windows minor version number.
     """
 
-    def __init__(self, cores: Union["list[int]", "set[int]", "tuple[int]", None] = None, log: Union[lg.RootLogger, None] = None):
+    def __init__(self, affinity: Union[list, set, tuple] = (), log: Union[lg.RootLogger, None] = None):
         """
         Contructs the asyncproc object and collects system information.
 
         Parameters
         ----------
-            cores : list[int], tuple[int], None
+            affinity : list[int], tuple[int], None
                 A list/set/tuple of integers which represents the CPU core affinity to use.
                 If it's a list/set/tuple, it should contain integers specifiying which cores to utilize specifically.
                 The range should from 0 to the max number of cores on the system.
@@ -157,16 +125,7 @@ class asyncproc:
                 If None, then the logging messages will be printed to the console.
         """
 
-        if type(cores) not in (list, set, tuple) and cores is not None:
-            raise TypeError("\"cores\" argument is not a valid type - requires list[int], set[int], tuple[int], None]")
-        else:
-            if type(cores) in (list, set, tuple):
-                if not all(True if type(i) == int else False for i in cores):
-                    raise TypeError("\"cores\" argument is not a valid type - requires list[int], set[int], tuple[int], None]")
-            elif cores is not None:
-                raise TypeError("\"cores\" argument is not a valid type - requires list[int], set[int], tuple[int], None]")
-
-        if log is not None and type(log) is not lg.RootLogger:
+        if log is not None and isinstance(log, lg.RootLogger):
             self._log = log
         else:
             self._log = None
@@ -184,27 +143,9 @@ class asyncproc:
         self._python_version_minor = ret[1]
         self._python_version_patch = ret[2]
 
-        self._thread_count = self.get_thread_count()
-
         del ret
+        self._get_info()
 
-        # Save this Python process' PID for future use.
-        self._pid = os.getpid()
-        # Get the reported number of CPU cores
-        self._cores_count = mp.cpu_count()
-        # For saving count of CPU sockets in systems, mostly for multi-socket use
-        self._sockets_count = 0
-        # Which cores are usable, based on the affinity for this process
-        self._cores_usable = ()
-        # Number of usable cores
-        self._cores_usable_count = 0
-        # List of physical cores - typically even numbered starting at 0
-        self._cores_physical = []
-        # List of logical cores - typically odd numbered starting at 1
-        self._cores_logical = []
-        # Whether the system has Simultaneous Multithreading / Hyperthreading
-        # This is a list for measuring SMT on multiple sockets,
-        self._smt = []
         if sys.platform == "linux":
             self._sys_platform = "Linux"
             self._get_info_linux()
@@ -223,6 +164,8 @@ class asyncproc:
                 global win32process
                 import win32process
             except ModuleNotFoundError as mnfe:
+                if self._log is not None:
+                    self._log.error(mnfe)
                 print(mnfe)
                 exit(1)
             self._get_info_windows()
@@ -232,22 +175,54 @@ class asyncproc:
         elif sys.platform.startswith("freebsd"):
             self._sys_platform = "FreeBSD"
 
-        self._cores_user = None
-        self._cores_user_count = None
-        if  cores is None or len(cores) >= self._cores_usable_count:
-            self._cores_user = self._cores_usable
-            self._cores_user_count = self._cores_usable_count
-        elif 0 < len(cores) and len(cores) <= self._cores_usable_count:
-            self._cores_user = cores
-            self._cores_user_count = len(self._cores_user)
-        else:
-            self._cores_user = self._cores_usable
-            self._cores_user_count = self._cores_usable_count
+        _check_instance(affinity, "affinity", (list, set, tuple,), can_be_none=False)
+        try:
+            if not all(True if isinstance(i, int) else False for i in affinity):
+                raise TypeError()
 
-        # A dictionary of processes, with keys being the group name.
-        self._processes = {}
-        # A dictionary of threads, with keys being the group name.
-        self._threads = {}
+            affinity = sorted(list(set(affinity)))
+            if len(affinity) >= len(self._cores_usable) or len(affinity) <= 0:
+                self._cores_user = self._cores_usable
+            elif 0 < len(affinity) and len(affinity) <= len(self._cores_usable):
+                self._cores_user = affinity
+            else:
+                self._cores_user = self._cores_usable
+        except TypeError as te:
+            raise TypeError("\"affinity\" argument is not a valid type - requires a list / set / tuple of integers.")
+
+    def _get_info(self):
+        self._pid = os.getpid()
+        # psutil process object for main process
+        self._process = psutil.Process(self._pid)
+        # Get main process data
+        with self._process.oneshot():
+            self._name = self._process.name()
+            self._pid = self._process.pid
+            self._nice = self._process.nice()
+            self._ionice = self._process.ionice()
+            self._affinity = self._process.cpu_affinity()
+            self._threads = self._process.threads()
+            self._num_threads = self._process.num_threads()
+            self._children = self._process.children()
+            self._parent = self._process.parent()
+            self._ppid = self._process.ppid()
+
+        self._cores_physical = psutil.cpu_count(logical=False)
+        self._cores_logical = psutil.cpu_count()
+        self._smt = (True if self._cores_logical > self._cores_physical else False)
+
+        # For saving count of CPU sockets in systems, mostly for multi-socket use
+        self._sockets = 0
+        # Which cores are usable, based on the affinity for this process
+        self._cores_usable = self._affinity
+        # List of cores that are in use by this program - can only use cores as specified by the user
+        self._cores_used = []
+        # Dictionary containing pools and their associated data
+        self._pools = {}
+        # # Set the multiprocessing conext for the program to "spawn" by default.
+        # # "spawn" is slower but safer than forking, and is usable on all operating systems.
+        # mp.set_start_method("spawn")
+        # self._mp_ctx = mp.get_context("spawn")
 
     def _get_info_freebsd(self) -> None:
         """
@@ -267,10 +242,9 @@ class asyncproc:
 
         """
         if sys.platform != "linux":
+            if self._log is not None:
+                self._log.error("Operating system is not Linux.")
             raise OSError("Operating system is not Linux.")
-
-        self._cores_usable = tuple(os.sched_getaffinity(0))
-        self._cores_usable_count = len(self._cores_usable)
 
         dict_lscpu = {}
         check = [
@@ -278,8 +252,7 @@ class asyncproc:
             "On-line CPU(s) list",
             "Thread(s) per core",
             "Core(s) per socket",
-            "Socket(s)",
-            "Model name"
+            "Socket(s)"
         ]
 
         cmd = shlex.split("lscpu")
@@ -292,17 +265,18 @@ class asyncproc:
             if key in check:
                 dict_lscpu[key] = value
 
-        self._sockets_count = int(dict_lscpu["Socket(s)"])
+        self._sockets = int(dict_lscpu["Socket(s)"])
         self._cores_physical = int(dict_lscpu["Core(s) per socket"])
         self._cores_logical = int(dict_lscpu["CPU(s)"])
         tmp_range = str(dict_lscpu["On-line CPU(s) list"]).split("-")
         self._cores_usable = tuple(i for i in range(int(tmp_range[0]), int(tmp_range[1]) + 1))
         self._smt = int(dict_lscpu["Thread(s) per core"]) > 1
-        self._model_name = dict_lscpu["Model name"]
 
     # INCOMPLETE - NEEDS TESTING ON MAC OS
     def _get_info_macos(self) -> None:
         if sys.platform != "darwin":
+            if self._log is not None:
+                self._log.error("Operating system is not MacOS.")
             raise OSError("Operating system is not MacOS.")
 
         tmp_dict = {}
@@ -317,7 +291,7 @@ class asyncproc:
         cmd = shlex.split("sysctl hw")
         ret = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE)
         out, err = ret.communicate()
-        for line in out:
+        for line in out.decode():
             for item in line.split(":"):
                 key = item[0].replace(" ", "").replace("\"", "").strip("hw.").lower()
                 value = item[1].strip(".\n ")
@@ -326,6 +300,8 @@ class asyncproc:
 
     def _get_info_windows(self) -> None:
         if sys.platform != "win32":
+            if self._log is not None:
+                self._log.error("Operating system is not Windows.")
             raise OSError("Operating system is not Windows.")
 
         tmp = sys.getwindowsversion()
@@ -333,46 +309,41 @@ class asyncproc:
         self._windows_version_minor = tmp.minor
         self._windows_version_build = tmp.build
 
-        self._cores_physical = 0
-        self._cores_logical = 0
-
         # Get simultaneous multithreading info
         # https://docs.microsoft.com/en-us/windows/win32/cimwin32prov/win32-processor
         winmgmts_root = win32com.client.GetObject("winmgmts:root\\cimv2")
         cpus = winmgmts_root.ExecQuery("Select * from Win32_Processor")
         for cpu in cpus:
-            self._sockets_count += 1
-            self._cores_physical += cpu.NumberOfCores
-            self._cores_logical += cpu.NumberOfLogicalProcessors
-            if cpu.NumberOfCores < cpu.NumberOfLogicalProcessors:
-                self._smt = True
-            self._model_name = cpu.Name
+            self._sockets += 1
+            # self._cores_physical += cpu.NumberOfCores
+            # self._cores_logical += cpu.NumberOfLogicalProcessors
+            # if cpu.NumberOfCores < cpu.NumberOfLogicalProcessors:
+            #     self._smt = True
 
         # Get affinity info
         handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, self._pid)
         mask = win32process.GetProcessAffinityMask(handle)
 
         self._cores_usable = self._mask_to_affinity(self._int_to_mask(int(mask[0])))
-        self._cores_usable_count = len(self._cores_usable)
 
-    def _int_to_mask(self, int_val: int) -> Tuple[str, ...]:
-        if type(int_val) != int:
+    def _int_to_mask(self, int_val: int) -> tuple[int, ...]:
+        if not isinstance(int_val, int):
             raise TypeError("\"int_val\" argument was not an int or str.")
         ret = "{0:08b}".format(int(int_val))
-        ret2: Tuple[str, ...] = tuple(i for i in ret)
+        ret2: tuple[int, ...] = tuple(int(i) for i in ret)
         return ret2
 
-    def _mask_to_int(self, mask: Tuple[str, ...]) -> Tuple[str, ...]:
-        ret = "".join(mask)
-        ret2: Tuple[str, ...] = tuple(i for i in ret)
+    def _mask_to_int(self, mask: tuple[int, ...]) -> tuple[int, ...]:
+        ret = "".join(str(mask))
+        ret2: tuple[int, ...] = tuple(int(i) for i in ret)
         return ret2
 
-    def _mask_to_affinity(self, mask: Tuple[str, ...]) -> Tuple[str, ...]:
+    def _mask_to_affinity(self, mask: tuple[int, ...]) -> tuple[int, ...]:
         mask_reversed = list(reversed(list(mask)))
-        ret: Tuple[str, ...] = tuple(str(i) for i in range(len(mask_reversed)) if int(mask_reversed[i]) == 1)
+        ret: tuple[int, ...] = tuple(int(i) for i in range(len(mask_reversed)) if int(mask_reversed[i]) == 1)
         return ret
 
-    def affinity_to_mask(self, affinity: Tuple[str, ...]) -> Tuple[str, ...]:
+    def _affinity_to_mask(self, affinity: tuple[int, ...]) -> tuple[int, ...]:
         affinity_list = list(affinity)
         mask_list = []
         start = 0
@@ -387,13 +358,13 @@ class asyncproc:
                     mask_list.append(0)
             mask_list.append(1)
             start = min_val
-            affinity_list.remove(str(min_val))
+            affinity_list.remove(min_val)
 
         while len(mask_list) % 8 != 0:
             mask_list.append(0)
 
         mask_reversed = list(reversed(mask_list))
-        ret: Tuple[str, ...] = tuple(mask_reversed)
+        ret: tuple[int, ...] = tuple(mask_reversed)
         return ret
 
     # def _run_in_parallel(self, functions: Union[dict, list, tuple], arguments: Union[dict, list, tuple], threads: int, sema: mp.synchronize.Semaphore, rlock: mp.synchronize.RLock):
@@ -417,12 +388,12 @@ class asyncproc:
     #         funcs_items = []
     #         if len(functions) == 0:
     #             raise IndexError("No functions were given.")
-    #         elif type(functions) is dict:
+    #         elif isinstance(functions, dict):
     #             funcs_items = [(name, func) for name, func in functions.items()]
-    #         elif type(functions) in (list, tuple):
+    #         elif isinstance(functions, (list, tuple)):
     #             for item in functions:
     #                 # Expect pair of "name, function" as a dict, list, or tuple
-    #                 if type(item) not in (dict, tuple, list):
+    #                 if not isinstance(item, (dict, tuple, list)):
     #                     raise TypeError("Function list contains a non-iterable element (requires a dict, list, or tuple).")
     #             funcs_items = [(name, func) for name, func in functions]
     #         for name, func in funcs_items:
@@ -436,16 +407,16 @@ class asyncproc:
     #         args_items = []
     #         if not self._no_args and len(arguments) == 0:
     #             raise IndexError("User specified that arguments are required but did no arguments were given.")
-    #         elif type(arguments) is dict:
+    #         elif isinstance(arguments, dict):
     #             args_items = [(name, value) for name, value in arguments.items()]
-    #         elif type(arguments) in (list, tuple):
+    #         elif isinstance(arguments, (list, tuple)):
     #             for item in arguments:
     #                 # Expect pair of "name, function" as a dict, list, or tuple
-    #                 if type(item) not in (dict, tuple, list):
+    #                 if not isinstance(item), (dict, tuple, list)):
     #                     raise TypeError("Argument list contains a non-iterable element (requires a dict, list, or tuple).")
-    #                 elif type(item) is dict:
+    #                 elif isinstance(item, dict):
     #                     args_items = [(name, value) for name, value in item]
-    #                 elif type(item) in (list, tuple):
+    #                 elif isinstance(item, (list, tuple)):
     #                     args_items = [(name, value) for name, value in item]
     #         for name, func in args_items:
     #             if self._test_callable(name, func):
@@ -455,9 +426,7 @@ class asyncproc:
     #             raise IndexError("None of the given functions are callable.")
     #     except IndexError as ie:
     #         if self._log is not None:
-    #             self._log.critical(ie)
-    #         else:
-    #             print(ie)
+    #             self._log.error(ie)
     #         exit(1)
     #
     #     self._run_map(func)
@@ -465,44 +434,26 @@ class asyncproc:
     def _run_map(self, func, args, name: str):
         return
 
-    def _test_callable(self, method: Callable, name: str) -> bool:
+    def _time_function(self, func: Callable, sema: sync.Semaphore, rlock: sync.RLock, *args: Union[list, set, tuple, None], **kwargs: Union[dict, None]) -> dict:
+        ret = {}
+        ret["Success"] = False
+        ret["return"] = None
+        was_acquired = False
         try:
-            if callable(method):
-                return True
-            else:
-                msg = "{} is not a callable method and will be removed from the pool."
-                if name is None:
-                    raise TypeError(msg.format(name))
-                else:
-                    raise TypeError(msg.format(name))
-        except TypeError as te:
+            was_acquired = True
+            sema.acquire()
+            ret["return"] = func(*args, **kwargs, sema=sema)
+            sema.release()
+            was_acquired = False
+            ret["Success"] = True
+            return ret
+        except Exception as e:
+            if was_acquired:
+                sema.release()
+            ret["Success"] = False
             if self._log is not None:
-                self._log.error(te)
-            else:
-                print(te)
-            return False
-
-    # def _time_function(self, func: Callable, args: Union[dict, list, set, tuple], sema: mp.synchronize.Semaphore, rlock: mp.synchronize.RLock) -> dict:
-    #     ret = {}
-    #     ret["Success"] = False
-    #     was_acquired = False
-    #     try:
-    #         was_acquired = True
-    #         sema.acquire()
-    #         ret["return"] = func(**args, sema=sema)
-    #         sema.release()
-    #         was_acquired = False
-    #         ret["Success"] = True
-    #         return ret
-    #     except Exception as e:
-    #         if was_acquired:
-    #             sema.release()
-    #         ret["Success"] = False
-    #         if self._log is not None:
-    #             self._log.error(e)
-    #         else:
-    #             print(e)
-    #         return ret
+                self._log.error(e)
+            raise TypeError(e)
 
     def get_affinity(self) -> tuple:
         return self._cores_usable
@@ -530,48 +481,99 @@ class asyncproc:
         self._cores_usable = tuple(new_affinity)
         return True
 
-    def get_thread_count(self):
-        return thrd.active_count()
+    # def get_thread_count(self):
+    #     return thrd.active_count()
 
-    def create_process_pool(self, group: Union[str, None] = None, processes: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None) -> bool:
-        check = (processes is None, (type(processes == int) and processes == 0))
+    def create_pool(self, pool_type: str = "", group: str = "", name: str = "", affinity: Union[list, set, tuple] = tuple(), initializer: Union[Callable, None] = None, initargs: Union[list, set, tuple] = ()):
+        _check_instance(pool_type, "pool_type", str, can_be_none=False)
+        pool_class = None
+        if pool_type == "process" or pool_type == "":
+            pool_class = asyncproc_process_pool
+        elif pool_type == "thread":
+            pool_class = asyncproc_thread_pool
+        else:
+            raise ValueError("\"pool_type\" has an incorrect value - it should either be \"process\" or \"thread\".")
+
+        _check_instance(group, "group", str, can_be_none=False)
+        if group == "":
+            group = "main"
+
+        _check_instance(affinity, "affinity", (list, set, tuple,), can_be_none=False)
+        if len(affinity) == 0:
+            affinity = list(self._cores_user)
+        elif 0 < len(affinity) and len(affinity) <= len(self._cores_usable):
+            affinity = list(affinity)
+
+        _check_instance(name, "name", str, can_be_none=False)
+        if name == "":
+            name = "{}-{}".format(group, pool_type)
+
+        # _check_callable(initializer, "initializer")
+        # print(initializer)
+        # if not callable(initializer) and initializer is not None:
+        #     raise TypeError("Function \"initializer\" object is not callable.")
+
+        if group not in self._pools.keys():
+            self._pools[group] = {}
+        if name in self._pools[group].keys():
+            msg = "Pool name \"{}\" already exists - please choose a different pool name, or run the \"pool_update\" function with the relevant arguments."
+            raise KeyError(msg.format(name))
+        self._pools[group][name] = {}
+        self._pools[group][name]["parent"] = psutil.Process().parent()
+        self._pools[group][name]["affinity"] = tuple(affinity)
+        self._pools[group][name]["initializer"] = initializer
+        self._pools[group][name]["initargs"] = tuple(initargs)
 
         try:
-            if group is not None:
-                try:
-                    group = str(group)
-                except TypeError as te:
-                    if self._log is not None:
-                        self._log.error(te)
-                    else:
-                        print(te)
-                    return False
-
-                if group not in self._processes:
-                    self._processes[group] = mp.Pool(self._cores_user_count)
-                else:
-                    ends_in_number = re.search(r"\d+$", group)
-                    if ends_in_number is not None:
-                        group_new = str(group.rstrip(ends_in_number.group()))
-                        new_number = str(int(ends_in_number.group()) + 1)
-                        self._processes[group_new + new_number] = mp.Pool(self._cores_user_count)
-                    else:
-                        self._processes[group + "-1"] = mp.Pool(self._cores_user_count)
-                return True
-            return False
-
+            self._pools[group][name]["pool"] = pool_class(
+                name=name,
+                affinity=self._pools[group][name]["affinity"],
+                # mp_context=self._mp_ctx,
+                initializer=self._pools[group][name]["initializer"],
+                initargs=self._pools[group][name]["initargs"]
+            )
         except Exception as e:
             if self._log is not None:
                 self._log.error(e)
-            else:
-                print(e)
-            return False
+            raise type(e)(e)
 
-    def create_process(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, daemon: Union[bool, None] = None):
+    def run_pool(self, function: Union[Callable, None] = None, *args: Any, **kwargs: Union[Mapping, None]):
         return
 
-    def create_thread_pool(self, group: Union[str, None] = None, threads: Union[int, None] = None, function: Union[Callable, None] = None, args: Union[dict, list, set, tuple, None] = None):
+
+class asyncproc_process_pool(multiprocessing.pool.Pool):
+    def __init__(self, name: str, affinity: list[int], initializer: Union[Callable, None] = None, initargs: tuple = (), maxtasksperchild: Union[int, None] = None, context: Union[mp.context.SpawnContext, None] = None):
+        self._name = name
+        self._affinity = affinity
+        self._processes = len(affinity)
+        self._initializer = initializer
+        self._initargs = initargs
+        self._maxtasksperchild = maxtasksperchild
+        self._context = context
+
+        if initializer is None:
+            super().__init__(processes=self._processes, maxtasksperchild=maxtasksperchild, context=context)
+        elif initializer is not None and len(initargs) != 0:
+            super().__init__(processes=self._processes, initializer=self._initializer, maxtasksperchild=self._maxtasksperchild, context=self._context)
+        else:
+            super().__init__(processes=self._processes, initializer=self._initializer, initargs=self._initargs, maxtasksperchild=self._maxtasksperchild, context=self._context)
+
+    def submit(self, func: Callable, *args: Any, **kwargs: Union[Mapping, None]):
         return
 
-    def create_thread(self, group: Union[str, None] = None, target: Union[Callable, None] = None, name: Union[str, None] = None, args=(), kwargs={}, daemon: Union[bool, None] = None):
-        return
+
+@announce_name
+class asyncproc_thread_pool(multiprocessing.pool.ThreadPool):
+    def __init__(self, name: str, affinity: list[int], initializer: Union[Callable, None] = None, initargs: tuple = (), maxtasksperchild: Union[int, None] = None, context: Union[mp.context.SpawnContext, None] = None):
+        self._name = name
+        self._affinity = affinity
+        self._processes = len(affinity)
+        self._initializer = initializer
+        self._initargs = initargs
+
+        if initializer is None:
+            super().__init__(processes=self._processes)
+        # elif initializer is not None and len(initargs) != 0:
+        #     super().__init__(processes=self._processes, initializer=self._initializer)
+        else:
+            super().__init__(processes=self._processes, initializer=self._initializer, initargs=self._initargs)
