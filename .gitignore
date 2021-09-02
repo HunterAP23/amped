@@ -130,3 +130,10 @@ dmypy.json
 
 # Custom
 Pipfile.lock
+package-lock.json
+
+# PyCharm
+.idea/
+
+# Node
+node_modules/

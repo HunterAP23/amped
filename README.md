@@ -1,75 +1,47 @@
-# asyncproc
-Simplifies the creation of asynchronous, multiprocess, and multithreaded code
+# AMPED
+__A__synchronous __M__ulti-__P__ool __E__xecution __D__irector
 
-# TODO
-## Create arguments & functions objects
-1. Use the `inspect.signature().parameters` function to find out how many arguments are needed and their names - refer to this as `N`.
-2. For each argument, the `create_argument` function needs the following info:
-  - From the user:
-    - Argument name (str)
-    - Argument value
-    - Argument type
-    - Which instances for a function it should be used (list, set, or tuple)
-3. For each function, the `create_function` function needs the following info:
-  - From the user:
-    - Function name (str)
-    - Pointer to the function (typing.Callable)
-    - Number of instances to run (int)
-  - From the function pointer:
-    - Arguments by name and expected values (dictionary)
+Simplifies the creation & management of asynchronous thread & process pools.
 
-## Relationship between processes, threads, and functions
-- The general idea is to allow the user to specify:
-  - The number of CPU physical and logical cores to use in total
-  - The number of CPU physical and logical cores to use per process on a per-process basis
-  - The number of processes to run in total
-  - The number of threads to run for each process on a per-process basis
-  - The number of functions to run in total
-  - The number of threads to run per process
-    - If thread-per-process is 1 then do not have to manually create a thread
-  - The number of functions to run per process
-  - The number of functions to run per thread
-  - Which functions to run
-  - What arguments to use for what functions
+# Summary
+AMPED is a cross-platform process and thread pool management library. It makes
+the steps required for creating thread and process pools much simpler, adds new
+features such as pool management & pool-nesting, provides thread-safe data
+transfer methods, and allows for granular control over CPU core assignment of
+individual pools.
 
-- Assuming 4 physical cores and 8 logical cores:
-  - How to specify 6 processes on to which cores:
-    - Manually -> list/set/tuple of ints:
-      - Index specifies core, value identifies how many processes
-      - IE: `[2, 0, 1, 2, 0, 1, 0, 0]`
-      - Advantage is variable is easy to set and work with
-      - Disadvantages:
-        - Only specifies info for processes-per-core
-        - Does not specify how many threads per process
+# Example Uses
+## Creating a Process Pool for CPU-bound tasks
+```python
+from amped import amped
 
-    group
-    	- specified by user at creation time or provided before running the pool, else part of default "main" group
-    	- if child pools are not explicitly given a group, then inherit parent's group
+def doubler(n):
+  return n * 2
 
-    name
-    	- specified by user at creation time
-    	- threadpool normally multiplies the # of CPU's by 5, so take name and append 1 to X to it
+handler = amped()
+handler.create_pool(pool_type="process", group="process-group-one", name="first")
+```
 
-    affinity
-    	- specified by user at creation time or changed later but before running the pool, else inherited from parent (current) process
+## Using a Process Pool
+```python
+ints = [1, 2, 3, 4]
+print("ints is {}".format(ints))
+for i in ints:
+  print(handler.submit_pool("process-group-one", "first", doubler, i))
+```
+```
+[1, 2, 3, 4]
+2
+4
+6
+8
+```
 
-    max_workers
-    	- based on affinity var
-    	- threadpool normally multiplies the # of CPU's by 5, have extra flag for threadpool to specifiy "threads per process"
+## Using the Map function
+```python
+ints = [1, 2, 3, 4]
+print("ints is {}".format(ints))
+  print(handler.submit_map("process-group-one", "first", doubler, ints))
+```
 
-    mp_context
-      - default to "spawn" on all systems
-
-    initializer
-    	- specified by user at creation time, else None
-    	- can not be changed
-
-    initargs
-    	- specified by user at creation time, else None
-    	- can not be changed
-
-    function(s)
-    	- specified by user before calling "submit" or "map" calls but after creation of pool
-
-    args
-    	- specified by user before calling "submit" or "map" calls but after creation of pool
+## Creating a Thread Pools for I/O-bound Tasks
