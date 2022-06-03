@@ -1,5 +1,5 @@
 # AMPED
-*__A__synchronous __M__ulti-__P__ool __E__xecution __D__irector*
+**A**synchronous **M**ulti-**P**ool **E**xecution **D**irector
 
 Simplifies the creation & management of asynchronous thread & process pools.
 
