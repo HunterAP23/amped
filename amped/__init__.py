@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Generator, Iterable, Mapping, Sequence, Set
+from collections.abc import Generator, Iterable, Mapping, MutableSet, Sequence, Set
 from concurrent.futures import ProcessPoolExecutor as ppe
 from concurrent.futures import ThreadPoolExecutor as tpe
 from concurrent.futures import _base
@@ -28,7 +28,7 @@ from concurrent.futures.process import _WorkItem as _WorkItem_Process
 from concurrent.futures.thread import _WorkItem as _WorkItem_Thread
 from contextlib import contextmanager
 from multiprocessing.context import BaseContext
-from typing import Any, Callable, Literal, Optional, Tuple, Type, Union
+from typing import Any, Callable, Literal, Optional, Tuple, Type, TypeVar, Union
 
 import psutil
 
@@ -37,9 +37,7 @@ _global_shutdown_lock = threading.Lock()
 _shutdown = False
 
 
-def _check_instance(
-    var: Any, name: str, types: Union[Type, tuple[Type, ...]], can_be_none=True
-) -> None:
+def _check_instance(var: Any, name: str, types: Union[Type, tuple[Type, ...]], can_be_none=True) -> None:
     if not isinstance(var, types) and var is None and not can_be_none:
         raise TypeError("'{}' object is not of type {}.".format(name, types))
 
@@ -47,6 +45,289 @@ def _check_instance(
 # def _check_callable(func: Callable, name: str, can_be_none=True) -> None:
 #     if not callable(func) and func is not None:
 #         raise TypeError("Function '{}' object is not callable.".format(name))
+
+
+# def _announce_initialization(proc):
+#     @ft.wraps(proc)
+#     def do_thing(*args, **kwargs):
+#         msg = "Initializing {}"
+#         print(msg.format(kwargs["name"]))
+#         return proc(*args, **kwargs)
+#     return do_thing
+
+################################################################################
+class cf_common:
+    def _submit_wrapper(self, *args, wrapped_func: Callable, choice: bool = False, **kwargs):
+        my_core = None
+        try:
+            # affinity_type = affinity._token.typeid
+            if self._affinity_type == "list":
+                while len(self._affinity) == 0:
+                    continue
+                while True:
+                    try:
+                        if self._choice:
+                            my_core = self._affinity.pop(self._affinity.index(rand.choice(self._affinity)))
+                        else:
+                            my_core = self._affinity.pop()
+                        break
+                    # Normally this could throw ValueError or IndexError exceptions
+                    # But we can just retry until we get what we need
+                    except Exception:
+                        continue
+            else:
+                my_core = self._affinity.get()
+        except AttributeError as ae:
+            raise AttributeError(ae)
+
+        psutil.Process().cpu_affinity([my_core])
+        ret = wrapped_func(*args, **kwargs)
+        if self._affinity_type == "list":
+            self._affinity.append(my_core)
+        else:
+            self._affinity.task_done()
+            self._affinity.put(my_core)
+        psutil.Process().cpu_affinity(list(self._affinity))
+        return ret
+
+
+################################################################################
+class _amped_process_pool_cf(cf_common):
+    def __init__(
+        self,
+        name: str,
+        affinity: list[int],
+        affinity_type: Literal["queue", "list"] = "queue",
+        choice: bool = False,
+        initializer: Optional[Callable[..., None]] = None,
+        initargs: Tuple[Any, ...] = (),
+        mp_context: Optional[BaseContext] = None,
+    ):
+        self._name = name
+        self._affinity = affinity
+        self._affinity_type = affinity_type
+        self._max_workers = len(affinity)
+        self._choice = choice
+        self._initializer = initializer
+        self._initargs = initargs
+        self._mp_context = mp_context
+
+        self._manager = mp.Manager()
+        if affinity_type == "list":
+            self._affinity_data = self._manager.list(affinity)
+        else:
+            self._affinity_data = self._manager.Queue(self._max_workers)
+            for i in affinity:
+                self._affinity_data.put(i)
+
+        if self._initializer is None:
+            # super().__init__(max_workers=self._max_workers, mp_context=self._mp_context)
+            self._parent = ppe(max_workers=self._max_workers, mp_context=self._mp_context)
+        else:
+            # super().__init__(
+            self._parent = ppe(
+                max_workers=self._max_workers,
+                mp_context=self._mp_context,
+                initializer=self._initializer,
+                initargs=self._initargs,
+            )
+
+    # def submit_wrapper(self, fn: Callable, *args: Any, **kwargs: Any) -> cf.Future:
+    # return super().submit(
+    # return self._parent.submit(
+    #     fn=_submit_wrapper,
+    #     *args,
+    #     wrapped_func=fn,
+    #     affinity=self._affinity_data,
+    #     choice=self._choice,
+    #     **kwargs
+    # )
+
+    def submit(self, fn: Callable, *args: Any, **kwargs: Any) -> cf.Future:
+        return super()._submit_wrapper(*args, wrapped_func=fn, **kwargs)
+
+    def map_wrapper(self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1):
+        if timeout is not None:
+            end_time = timeout + time.monotonic()
+
+        fs = [self.submit_wrapper(fn, *args) for args in zip(*iterables)]
+
+        def result_iterator():
+            try:
+                fs.reverse()
+                while fs:
+                    while len(fs) == 0:
+                        continue
+                    if timeout is None:
+                        yield fs.pop().result()
+                    else:
+                        yield fs.pop().result(end_time - time.monotonic())
+            finally:
+                for future in fs:
+                    future.cancel()
+
+        return result_iterator()
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        # return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+        return self._parent.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+################################################################################
+class _amped_thread_pool_cf(cf_common):
+    def __init__(
+        self,
+        name: str,
+        affinity: list[int],
+        affinity_type: Literal["queue", "list"] = "queue",
+        choice: bool = False,
+        initializer: Optional[Callable[..., None]] = None,
+        initargs: Tuple[Any, ...] = (),
+        mp_context: Optional[mp.context.SpawnContext] = None,
+    ) -> None:
+        self._name = name
+        self._affinity = affinity
+        self._max_workers = len(affinity)
+        self._choice = choice
+        self._initializer = initializer
+        self._initargs = initargs
+
+        self._manager = mp.Manager()
+        if affinity_type == "list":
+            self._affinity_data = self._manager.list(self._affinity)
+        else:
+            self._affinity_data = self._manager.Queue(len(self._affinity))
+            for i in affinity:
+                self._affinity_data.put(i)
+
+        if self._initializer is None:
+            # super().__init__(
+            self._parent = tpe(max_workers=self._max_workers, thread_name_prefix=self._name)
+        else:
+            # super().__init__(
+            self._parent = tpe(
+                max_workers=self._max_workers,
+                thread_name_prefix=self._name,
+                initializer=self._initializer,
+                initargs=self._initargs,
+            )
+
+    def submit_wrapper(self, fn, *args, **kwargs) -> cf.Future:
+        # return super().submit(
+        return self._parent.submit(fn=_submit_wrapper, *args, wrapped_func=fn, affinity=self._affinity_data, choice=self._choice, **kwargs)
+
+    def apply(self, fn, *args, **kwargs) -> cf.Future:
+        return self.submit(fn, *args, **kwargs)
+
+    def map_wrapper(self, fn, *iterables: Iterable[Any], timeout: Optional[float] = None, chunksize: int = 1):
+        if timeout is not None:
+            end_time = timeout + time.monotonic()
+
+        fs = [self.submit_wrapper(fn, *args) for args in zip(*iterables)]
+
+        def result_iterator():
+            try:
+                fs.reverse()
+                while fs:
+                    while len(fs) == 0:
+                        continue
+                    if timeout is None:
+                        yield fs.pop().result()
+                    else:
+                        yield fs.pop().result(end_time - time.monotonic())
+            finally:
+                for future in fs:
+                    future.cancel()
+
+        return result_iterator()
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        # return super().shutdown(wait=wait, cancel_futures=cancel_futures)
+        return self._parent.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+################################################################################
+# class _amped_process_pool_mp:
+#     def __init__(
+#         self,
+#         name: str,
+#         affinity: list[int],
+#         affinity_type: Literal["queue", "list"] = "queue",
+#         choice: bool = False,
+#         initializer: Optional[Callable[..., None]] = None,
+#         initargs: Tuple[Any, ...] = (),
+#         maxtasksperchild: Optional[int] = None,
+#         mp_context: Optional[mp.context.SpawnContext] = None,
+#     ) -> None:
+#         self._name = name
+#         self._affinity = affinity
+#         self._max_workers = len(affinity)
+#         self._choice = choice
+#         self._initializer = initializer
+#         self._initargs = initargs
+#         self._mp_context = mp_context
+#
+#         self._manager = mp.Manager()
+#         if affinity_type == "list":
+#             self._affinity_data = self._manager.list(self._affinity)
+#         else:
+#             self._affinity_data = self._manager.Queue(len(self._affinity))
+#             for i in affinity:
+#                 self._affinity_data.put(i)
+#
+#         if self._initializer is None:
+#             # super().__init__(processes=self._max_workers, context=self._mp_context)
+#             self._parent = mpp.Pool(
+#                 processes=self._max_workers, context=self._mp_context
+#             )
+#         else:
+#             # super().__init__(
+#             self._parent = mpp.Pool(
+#                 processes=self._max_workers,
+#                 initializer=self._initializer,
+#                 initargs=self._initargs,
+#                 context=self._mp_context,
+#             )
+#
+#     def apply_wrapper(self, fn, *args: Any, **kwargs: Any):
+#         kw = {}
+#         kw["wrapped_func"] = fn
+#         kw["affinity"] = self._affinity_data
+#         kw["choice"] = self._choice
+#         # return super().apply(func=_submit_wrapper, *args, **kw, **kwargs)
+#         return self._parent.apply(func=_submit_wrapper, *args, **kw, **kwargs)
+#
+#     def map_wrapper(
+#         self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
+#     ):
+#         if timeout is not None:
+#             end_time = timeout + time.monotonic()
+#
+#         fs = [self.apply_wrapper(fn, *args) for args in zip(*iterables)]
+#
+#         def result_iterator():
+#             try:
+#                 fs.reverse()
+#                 while fs:
+#                     while len(fs) == 0:
+#                         continue
+#                     if timeout is None:
+#                         yield fs.pop().result()
+#                     else:
+#                         yield fs.pop().result(end_time - time.monotonic())
+#             finally:
+#                 for future in fs:
+#                     future.cancel()
+#
+#         return result_iterator()
+#
+#     def shutdown(self):
+#         # super().close()
+#         self._parent.close()
+#         # super().join()
+#         self._parent.join()
+#         return
+################################################################################
 
 
 class amped_error(Exception):
@@ -175,9 +456,7 @@ class amped:
             self._log_exception(TypeError(msg))
 
         affinity = sorted(list(set(affinity)))
-        affinity = [
-            i for i in affinity if i >= 0 and i <= (len(self._cores_usable) - 1)
-        ]
+        affinity = [i for i in affinity if i >= 0 and i <= (len(self._cores_usable) - 1)]
 
         if len(affinity) >= len(self._cores_usable) or len(affinity) <= 0:
             self._cores_user = self._cores_usable
@@ -217,15 +496,11 @@ class amped:
         # For saving count of CPU sockets in systems, mostly for multi-socket use
         self._sockets = 0
         # Which cores are usable, based on the affinity for this process
-        self._cores_usable = self._affinity
+        self._cores_usable = tuple(self._affinity)
         # List of cores that are in use by this program - can only use cores as specified by the user
         self._cores_used = []
         # Dictionary containing pools and their associated data
         self._pools = {}
-        # # Set the multiprocessing conext for the program to "spawn" by default.
-        # # "spawn" is slower but safer than forking, and is usable on all operating systems.
-        # mp.set_start_method("spawn")
-        # self._mp_ctx = mp.get_context("spawn")
 
     # def _get_info_freebsd(self) -> None:
     #     """
@@ -236,14 +511,7 @@ class amped:
     #     """
     #     int(os.popen("sysctl -n hw.ncpu").readlines()[0])
 
-    def _time_function(
-        self,
-        func: Callable,
-        sema: sync.Semaphore,
-        rlock: sync.RLock,
-        *args: Any,
-        **kwargs: Any
-    ) -> Mapping:
+    def _time_function(self, func: Callable, sema: sync.Semaphore, rlock: sync.RLock, *args: Any, **kwargs: Any) -> Mapping:
         ret = {}
         ret["Success"] = False
         ret["return"] = None
@@ -262,7 +530,7 @@ class amped:
             ret["Success"] = False
             self._log_exception(e)
 
-    def get_affinity(self) -> tuple:
+    def get_affinity(self) -> Iterable:
         return self._cores_usable
 
     def set_affinity(self, affinity: Union[Sequence[int], Set[int]]) -> bool:
@@ -304,10 +572,17 @@ class amped:
         pool_type: Literal["process", "thread"] = "thread",
         group: str = "",
         name: str = "",
-        affinity: Union[Sequence[int], Set[int]] = (),
+        affinity: Union[Sequence[int], Set[int], MutableSet[int]] = (),
+        affinity_type: Literal["queue", "list"] = "queue",
+        choice: bool = False,
         initializer: Optional[Callable[..., None]] = None,
         initargs: Tuple[Any, ...] = (),
-    ):
+    ) -> Union[
+        # _amped_process_pool_cf, _amped_thread_pool_cf, _amped_process_pool_mp, None
+        _amped_process_pool_cf,
+        _amped_thread_pool_cf,
+        None,
+    ]:
         """
         Create a pool of threads or processes.
         """
@@ -319,17 +594,8 @@ class amped:
         # Defines what class to use based on given call to this function
         pool_class = None
 
-        # 'multiprocessing' will only support a pool of processes
-        # No reason to create a thread pool using the multiprocessing library
-        # Incorrect 'pool_type' values will raise an exception
-        if library == "multiprocessing":
-            if pool_type == "process":
-                pool_class = _amped_process_pool_mp
-            else:
-                msg = "'multiprocessing' library only supports 'process' pool_type."
-                self._log_exception(ValueError(msg))
         # 'concurrent' library supports both process and thread pools
-        elif library == "concurrent":
+        if library == "concurrent":
             if pool_type == "process":
                 pool_class = _amped_process_pool_cf
             elif pool_type == "thread":
@@ -399,6 +665,8 @@ class amped:
         self._pools[group][name] = {}
         self._pools[group][name]["parent"] = psutil.Process().parent()
         self._pools[group][name]["affinity"] = tuple(affinity)
+        self._pools[group][name]["affinity_type"] = affinity_type
+        self._pools[group][name]["choice"] = choice
         self._pools[group][name]["initializer"] = initializer
         self._pools[group][name]["initargs"] = tuple(initargs)
 
@@ -408,6 +676,8 @@ class amped:
             self._pools[group][name]["pool"] = pool_class(
                 name=name,
                 affinity=self._pools[group][name]["affinity"],
+                affinity_type=self._pools[group][name]["affinity_type"],
+                choice=self._pools[group][name]["choice"],
                 # mp_context=self._mp_ctx,
                 initializer=self._pools[group][name]["initializer"],
                 initargs=self._pools[group][name]["initargs"],
@@ -415,465 +685,31 @@ class amped:
             return self._pools[group][name]["pool"]
         except Exception as e:
             self._log_exception(e)
+            return
 
     def shutdown(self, group: str, name: str, wait=True, cancel_futures=False):
         self._pool_check(group, name)
 
-        ret = self._pools[group][name]["pool"].shutdown(
-            wait=wait, cancel_futures=cancel_futures
-        )
+        ret = self._pools[group][name]["pool"].shutdown(wait=wait, cancel_futures=cancel_futures)
         del self._pools[group][name]
         return ret
 
-    def submit(
-        self, group: str, name: str, function: Callable, *args: Any, **kwargs: Any
-    ):
+    def submit(self, group: str, name: str, function: Callable, *args: Any, **kwargs: Any):
         self._pool_check(group, name)
 
         return self._pools[group][name]["pool"].submit(function, *args, **kwargs)
 
-    def map_normal(
-        self, group: str, name: str, function: Callable, *args: Any, chunksize: int = 1
-    ):
+    def map(self, group: str, name: str, map_type: Literal["normal", "wrapper", "builtin"], function: Callable, *args: Any, chunksize: int = 1):
         self._pool_check(group, name)
 
-        return self._pools[group][name]["pool"].map_normal(
-            function, chunksize=chunksize, *args
-        )
+        return self._pools[group][name]["pool"].map(function, chunksize=chunksize, *args)
 
-    def map_affinity_wrapper(
-        self, group: str, name: str, function: Callable, *args: Any, chunksize: int = 1
-    ):
+    def map_wrapper(self, group: str, name: str, function: Callable, *args: Any, chunksize: int = 1):
         self._pool_check(group, name)
 
-        return self._pools[group][name]["pool"].map_affinity(
-            function, chunksize=chunksize, *args
-        )
+        return self._pools[group][name]["pool"].map_wrapper(function, chunksize=chunksize, *args)
 
-    def map_affinity_builtin(
-        self, group: str, name: str, function: Callable, *args: Any, chunksize: int = 1
-    ):
+    def map_builtin(self, group: str, name: str, function: Callable, *args: Any, chunksize: int = 1):
         self._pool_check(group, name)
 
-        return self._pools[group][name]["pool"].map_affinity(
-            function, chunksize=chunksize, *args
-        )
-
-
-# def _announce_initialization(proc):
-#     @ft.wraps(proc)
-#     def do_thing(*args, **kwargs):
-#         msg = "Initializing {}"
-#         print(msg.format(kwargs["name"]))
-#         return proc(*args, **kwargs)
-#     return do_thing
-
-
-def _submit_wrapper(*args, wrapped_func: Callable, affinity, **kwargs):
-    my_core = None
-    try:
-        affinity_type = affinity._token.typeid
-        if affinity_type == "list":
-            while len(affinity) == 0:
-                continue
-            while True:
-                try:
-                    my_core = affinity.pop(affinity.index(rand.choice(affinity)))
-                    break
-                # Normally this could throw ValueError or IndexError exceptions
-                # But we can just retry until we get what we need
-                except Exception:
-                    continue
-        # elif affinity_type == "Queue":
-        else:
-            my_core = affinity.get()
-    except AttributeError as ae:
-        raise AttributeError(ae)
-
-    psutil.Process().cpu_affinity([my_core])
-    ret = wrapped_func(*args, **kwargs)
-    affinity.task_done()
-    affinity.put(my_core)
-    psutil.Process().cpu_affinity(list(affinity))
-    return ret
-
-
-################################################################################
-class _amped_process_pool_cf(ppe):
-    def __init__(
-        self,
-        name: str,
-        affinity: list[int],
-        affinity_type: Literal["list", "queue"] = "queue",
-        initializer: Optional[Callable[..., None]] = None,
-        initargs: Tuple[Any, ...] = (),
-        mp_context: Optional[BaseContext] = None,
-    ):
-        self._name = name
-        self._affinity = affinity
-        self._max_workers = len(affinity)
-        self._initializer = initializer
-        self._initargs = initargs
-        self._mp_context = mp_context
-
-        self._manager = mp.Manager()
-        if affinity_type == "list":
-            self._affinity_data = self._manager.list(self._affinity)
-        else:
-            self._affinity_data = self._manager.Queue(len(self._affinity))
-            for i in affinity:
-                self._affinity_data.put(i)
-
-        if self._initializer is None:
-            super().__init__(max_workers=self._max_workers, mp_context=self._mp_context)
-        else:
-            super().__init__(
-                max_workers=self._max_workers,
-                mp_context=self._mp_context,
-                initializer=self._initializer,
-                initargs=self._initargs,
-            )
-
-    def submit_normal(self, fn: Callable, *args: Any, **kwargs: Any) -> cf.Future:
-        return super().submit(fn, *args, **kwargs)
-
-    def submit_affinity_wrapper(
-        self, fn: Callable, *args: Any, **kwargs: Any
-    ) -> cf.Future:
-        return super().submit(
-            fn=_submit_wrapper,
-            *args,
-            wrapped_func=fn,
-            affinity=self._affinity_data,
-            **kwargs
-        )
-
-    def submit_builtin(self, fn: Callable, *args: Any, **kwargs: Any) -> cf.Future:
-        with self._shutdown_lock:
-            if self._broken:
-                raise cf.process.BrokenProcessPool(self._broken)
-            if self._shutdown_thread:
-                raise RuntimeError("cannot schedule new futures after shutdown")
-            if _global_shutdown:
-                raise RuntimeError(
-                    "cannot schedule new futures after interpreter shutdown"
-                )
-
-            f = _base.Future()
-            w = _WorkItem_Process(f, fn, args, kwargs)
-
-            self._pending_work_items[self._queue_count] = w
-            self._work_ids.put(self._queue_count)
-            self._queue_count += 1
-            # Wake up queue management thread
-            self._executor_manager_thread_wakeup.wakeup()
-
-            self._adjust_process_count()
-            self._start_executor_manager_thread()
-            return f
-
-    def map_normal(
-        self,
-        fn: Callable,
-        *iterables: Any,
-        timeout: Optional[float] = None,
-        chunksize: Optional[int] = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.submit_normal(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def map_affinity_wrapper(
-        self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.submit_affinity_wrapper(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def shutdown(self, wait=True, cancel_futures=False):
-        return super().shutdown(wait=wait, cancel_futures=cancel_futures)
-
-
-################################################################################
-class _amped_thread_pool_cf(tpe):
-    def __init__(
-        self,
-        name: str,
-        affinity: list[int],
-        affinity_type: Literal["list", "queue"] = "queue",
-        initializer: Optional[Callable[..., None]] = None,
-        initargs: Tuple[Any, ...] = (),
-        mp_context: Optional[mp.context.SpawnContext] = None,
-    ) -> None:
-        self._name = name
-        self._affinity = affinity
-        self._max_workers = len(affinity)
-        self._initializer = initializer
-        self._initargs = initargs
-
-        self._manager = mp.Manager()
-        if affinity_type == "list":
-            self._affinity_data = self._manager.list(self._affinity)
-        else:
-            self._affinity_data = self._manager.Queue(len(self._affinity))
-            for i in affinity:
-                self._affinity_data.put(i)
-
-        if self._initializer is None:
-            super().__init__(
-                max_workers=self._max_workers, thread_name_prefix=self._name
-            )
-        else:
-            super().__init__(
-                max_workers=self._max_workers,
-                thread_name_prefix=self._name,
-                initializer=self._initializer,
-                initargs=self._initargs,
-            )
-
-    def submit_normal(self, fn, *args, **kwargs) -> cf.Future:
-        return super().submit(fn, *args, **kwargs)
-
-    def submit_affinity_wrapper(self, fn, *args, **kwargs) -> cf.Future:
-        return super().submit(
-            fn=_submit_wrapper,
-            *args,
-            wrapped_func=fn,
-            affinity=self._affinity_data,
-            **kwargs
-        )
-
-    def submit_affinity_builtin(self, fn, *args, **kwargs) -> cf.Future:
-        with self._shutdown_lock, _global_shutdown_lock:
-            if self._broken:
-                raise cf.thread.BrokenThreadPool(self._broken)
-
-            if self._shutdown:
-                msg = "cannot schedule new futures after shutdown"
-                raise RuntimeError(msg)
-            if _shutdown:
-                msg = "cannot schedule new futures after interpreter shutdown"
-                raise RuntimeError(msg)
-
-            f = _base.Future()
-            w = _WorkItem_Thread(f, fn, args, kwargs)
-
-            self._work_queue.put(w)
-            self._adjust_thread_count()
-            return f
-
-    def map_normal(
-        self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.submit_normal(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def map_affinity_wrapper(
-        self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.submit_affinity_wrapper(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def map_affinity_builtin(
-        self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.submit_affinity_builtin(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def shutdown(self, wait=True, cancel_futures=False):
-        return super().shutdown(wait=wait, cancel_futures=cancel_futures)
-
-
-################################################################################
-class _amped_process_pool_mp(mpp.Pool):
-    def __init__(
-        self,
-        name: str,
-        affinity: list[int],
-        affinity_type: Literal["list", "queue"] = "queue",
-        initializer: Optional[Callable[..., None]] = None,
-        initargs: Tuple[Any, ...] = (),
-        maxtasksperchild: Optional[int] = None,
-        mp_context: Optional[mp.context.SpawnContext] = None,
-    ) -> None:
-        self._name = name
-        self._affinity = affinity
-        self._max_workers = len(affinity)
-        self._initializer = initializer
-        self._initargs = initargs
-        self._mp_context = mp_context
-
-        self._manager = mp.Manager()
-        if affinity_type == "list":
-            self._affinity_data = self._manager.list(self._affinity)
-        else:
-            self._affinity_data = self._manager.Queue(len(self._affinity))
-            for i in affinity:
-                self._affinity_data.put(i)
-
-        if self._initializer is None:
-            super().__init__(processes=self._max_workers, context=self._mp_context)
-        else:
-            super().__init__(
-                processes=self._max_workers,
-                initializer=self._initializer,
-                initargs=self._initargs,
-                context=self._mp_context,
-            )
-
-    def apply_normal(self, fn, *args: Any, **kwargs: Any):
-        return super().apply(fn, *args, **kwargs)
-
-    def apply_affinity(self, fn, *args: Any, **kwargs: Any):
-        kw = {}
-        kw["wrapped_func"] = fn
-        kw["affinity"] = self._affinity_data
-        # return super().apply(
-        #     func=_submit_wrapper,
-        #     *args,
-        #     wrapped_func=fn,
-        #     affinity=self._affinity_data,
-        #     **kwargs
-        # )
-        return super().apply(func=_submit_wrapper, *args, **kw, **kwargs)
-
-    def map_wrapper(
-        self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.apply_affinity(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def map_normal(
-        self, fn, *iterables: Any, timeout: Optional[float] = None, chunksize: int = 1
-    ):
-        if timeout is not None:
-            end_time = timeout + time.monotonic()
-
-        fs = [self.apply_normal(fn, *args) for args in zip(*iterables)]
-
-        def result_iterator():
-            try:
-                fs.reverse()
-                while fs:
-                    while len(fs) == 0:
-                        continue
-                    if timeout is None:
-                        yield fs.pop().result()
-                    else:
-                        yield fs.pop().result(end_time - time.monotonic())
-            finally:
-                for future in fs:
-                    future.cancel()
-
-        return result_iterator()
-
-    def shutdown(self):
-        super().close()
-        super().join()
-        return
+        return self._pools[group][name]["pool"].map_builtin(function, chunksize=chunksize, *args)
